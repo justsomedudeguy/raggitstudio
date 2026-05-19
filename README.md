@@ -21,7 +21,7 @@ stay local and are intentionally ignored by git.
   `.jsonl`, `.ndjson`, `.json`, `.zst`, and `.zst_blocks` files.
 - Stores Reddit posts and comments in normalized SQLite tables with FTS, raw JSON,
   metadata, exact count/search endpoints, and archive coverage metrics.
-- Routes exact count prompts, such as `How many times is "P2P" mentioned?`, to the raw
+- Routes exact count prompts, such as `How many times is "XXX" mentioned?`, to the raw
   archive index instead of asking the LLM to guess.
 - Adds archive-backed context to semantic chat queries so answers can cite raw Reddit rows.
 
