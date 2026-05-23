@@ -163,7 +163,10 @@ class IngestionService:
         )
         if not chunks:
             return
-        embeddings = await self.lemonade.embed(self.settings.embedding_model_id, [chunk.text for chunk in chunks])
+        try:
+            embeddings = await self.lemonade.embed(self.settings.embedding_model_id, [chunk.text for chunk in chunks])
+        except Exception:
+            raise ValueError(f"Embedding model '{self.settings.embedding_model_id}' is not available on the configured endpoint") from None
         for chunk, vector in zip(chunks, embeddings, strict=False):
             chunk_id = self.database.insert_chunk(
                 document_id,
@@ -203,15 +206,16 @@ class RagService:
 
     async def search(self, query: str, top_k: int = 8, filters: dict[str, Any] | None = None) -> dict[str, Any]:
         embeddings = self.database.all_embeddings()
-        if not embeddings:
+        archive_embeddings = self.database.all_archive_embeddings()
+        if not embeddings and not archive_embeddings:
             return {"results": [], "packed_context": "", "retrieval_run_id": None}
-        query_vector = np.asarray((await self.lemonade.embed(self.settings.embedding_model_id, [query]))[0], dtype=np.float32)
-        candidates = [(int(row["chunk_id"]), blob_to_vector(row["vector_blob"])) for row in embeddings]
-        ranked = cosine_rank(query_vector, candidates, top_k=120)
-        chunk_ids = [item.chunk_id for item in ranked]
-        chunks = self.database.get_chunks(chunk_ids)
-        chunks_by_id = {int(chunk["id"]): chunk for chunk in chunks}
-        ordered_chunks = [chunks_by_id[item.chunk_id] for item in ranked if item.chunk_id in chunks_by_id]
+        try:
+            query_vector = np.asarray((await self.lemonade.embed(self.settings.embedding_model_id, [query]))[0], dtype=np.float32)
+        except Exception:
+            raise ValueError(f"Embedding model '{self.settings.embedding_model_id}' is not available on the configured endpoint") from None
+        ordered_chunks = self._rank_generic_chunks(query_vector, embeddings)
+        ordered_chunks.extend(self._rank_archive_chunks(query_vector, archive_embeddings))
+        ordered_chunks.sort(key=lambda chunk: float(chunk.get("score", 0.0)), reverse=True)
         reranked_chunks = await self._rerank(query, ordered_chunks[:40], top_k)
         packed = pack_context(reranked_chunks, max_chars=18000)
         results = [
@@ -221,11 +225,62 @@ class RagService:
                 "text": chunk["text"],
                 "metadata": chunk.get("metadata", {}),
                 "score": chunk.get("score", 0.0),
+                "source": chunk.get("source", "corpus"),
             }
             for chunk in reranked_chunks
         ]
         run_id = self.database.insert_retrieval_run(query, filters or {}, results, packed)
         return {"results": results, "packed_context": packed, "retrieval_run_id": run_id}
+
+    def _rank_generic_chunks(self, query_vector: np.ndarray, embeddings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not embeddings:
+            return []
+        candidates = [(int(row["chunk_id"]), blob_to_vector(row["vector_blob"])) for row in embeddings]
+        ranked = cosine_rank(query_vector, candidates, top_k=120)
+        chunk_ids = [item.chunk_id for item in ranked]
+        chunks = self.database.get_chunks(chunk_ids)
+        chunks_by_id = {int(chunk["id"]): chunk for chunk in chunks}
+        ordered = []
+        for item in ranked:
+            chunk = chunks_by_id.get(item.chunk_id)
+            if chunk:
+                next_chunk = dict(chunk)
+                next_chunk["score"] = item.score
+                next_chunk["source"] = "corpus"
+                ordered.append(next_chunk)
+        return ordered
+
+    def _rank_archive_chunks(self, query_vector: np.ndarray, embeddings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not embeddings:
+            return []
+        candidates = [(int(row["semantic_chunk_id"]), blob_to_vector(row["vector_blob"])) for row in embeddings]
+        ranked = cosine_rank(query_vector, candidates, top_k=120)
+        chunk_ids = [item.chunk_id for item in ranked]
+        chunks = self.database.get_archive_semantic_chunks(chunk_ids)
+        chunks_by_id = {int(chunk["id"]): chunk for chunk in chunks}
+        ordered = []
+        for item in ranked:
+            chunk = chunks_by_id.get(item.chunk_id)
+            if not chunk:
+                continue
+            metadata = dict(chunk.get("metadata") or {})
+            metadata.setdefault("title", chunk.get("title") or f"r/{chunk.get('subreddit', 'unknown')}")
+            metadata.setdefault("source_type", "reddit_archive")
+            metadata.setdefault("subreddit", chunk.get("subreddit"))
+            metadata.setdefault("author", chunk.get("author"))
+            metadata.setdefault("score", chunk.get("score"))
+            ordered.append(
+                {
+                    "id": int(chunk["id"]),
+                    "citation_id": chunk["citation_id"],
+                    "text": chunk["text"],
+                    "metadata": metadata,
+                    "title": metadata.get("title"),
+                    "score": item.score,
+                    "source": "reddit_archive",
+                }
+            )
+        return ordered
 
     async def _rerank(self, query: str, chunks: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
         if not chunks:
@@ -254,4 +309,3 @@ def _same_domain_links(html: str, base_url: str, host: str) -> list[str]:
         if urlsplit(url).netloc == host:
             links.append(url)
     return links
-

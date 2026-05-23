@@ -1,0 +1,12 @@
+{
+  "name": "customchat",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently \"powershell.exe -File ./scripts/start-backend.ps1\" \"npm run dev --prefix frontend\"",
+    "dev:frontend": "npm run dev --prefix frontend",
+    "dev:backend": "powershell.exe -File ./scripts/start-backend.ps1"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

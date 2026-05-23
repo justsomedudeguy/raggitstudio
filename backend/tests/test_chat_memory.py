@@ -85,6 +85,7 @@ def test_chat_stream_persists_user_assistant_and_system_prompt(tmp_path):
         "POST",
         "/api/chat/stream",
         json={
+            "model_id": "chat-model",
             "system_prompt": "Use concise citations.",
             "messages": [{"role": "user", "content": "What did we save?"}],
             "mode": "direct",
@@ -100,6 +101,24 @@ def test_chat_stream_persists_user_assistant_and_system_prompt(tmp_path):
     assert detail["messages"][1]["content"] == "remembered answer"
     assert detail["messages"][1]["reasoning"] == "reasoned "
     assert fake.chat_payloads[0]["messages"][0] == {"role": "system", "content": "Use concise citations."}
+
+
+def test_chat_stream_requires_explicit_chat_model(tmp_path):
+    fake = MemoryFakeLemonade()
+    app = _app(tmp_path, lemonade=fake)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/chat/stream",
+        json={
+            "messages": [{"role": "user", "content": "Do not use a default model."}],
+            "mode": "direct",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Choose a chat model before sending."
+    assert fake.chat_payloads == []
 
 
 def test_chat_stream_uses_requested_chat_model(tmp_path):
@@ -130,6 +149,7 @@ def test_contextual_web_search_runs_when_query_asks_for_current_info(tmp_path):
         "POST",
         "/api/chat/stream",
         json={
+            "model_id": "chat-model",
             "messages": [{"role": "user", "content": "What is the latest news about alpha?"}],
             "mode": "direct",
             "tools_enabled": True,

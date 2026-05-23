@@ -6,6 +6,8 @@ import {
   Brain,
   Camera,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   CircleAlert,
   Clock3,
   Database,
@@ -21,6 +23,7 @@ import {
   Search,
   Send,
   Square,
+  Trash2,
   Upload,
   Wrench,
   XCircle,
@@ -31,24 +34,43 @@ import {
   captureScreenshot,
   countArchive,
   createConversation,
+  exportArchiveSubredditHtml,
+  fetchArchiveClearJob,
   fetchArchives,
+  fetchArchiveSubreddits,
   fetchConversation,
   fetchConversations,
   fetchDocuments,
+  fetchRedditImportJob,
   fetchSources,
   fetchStatus,
   importArchive,
   ingestSource,
+  loadChatModel,
+  purgeArchives,
   searchArchive,
   searchRag,
+  startArchiveSubredditClear,
+  startRedditImport,
   streamChat,
   updateConversation,
+  updateProviderSettings,
 } from "./api";
+import {
+  compactListPreview,
+  formatClearStartedMessage,
+  formatPurgeSummary,
+  formatUtcDateRange,
+  openArchiveExportUrl,
+  sourceFilePreview,
+} from "./dataPanel";
 import { chooseChatModelId } from "./modelSelection";
 import type {
   ArchiveCountResult,
+  ArchiveClearJob,
   ArchiveCoverage,
   ArchiveFileRecord,
+  ArchiveSubredditSummary,
   ArchiveImportResult,
   ArchiveSearchResult,
   ChatApiMessage,
@@ -62,6 +84,7 @@ import type {
   ModelOption,
   RagResult,
   RagSearchResponse,
+  RedditImportJob,
   ScreenshotCapture,
   SourceRecord,
   SseFrame,
@@ -97,12 +120,13 @@ interface NavItem {
 }
 
 const NAV_ITEMS: NavItem[] = [
-  { key: "chat", label: "Chat", icon: MessageSquare },
+  { key: "chat", label: "RAG Studio", icon: Brain },
   { key: "corpus", label: "Corpus", icon: Database },
-  { key: "archives", label: "Archives", icon: Archive },
+  { key: "archives", label: "Archive Mgmt", icon: Archive },
   { key: "retrieval", label: "Retrieval Lab", icon: Search },
   { key: "status", label: "Status", icon: Activity },
 ];
+const ACTIVE_CLEAR_JOB_STORAGE_KEY = "customchat.activeArchiveClearJobId";
 
 function App() {
   const [activeView, setActiveView] = useState<ViewKey>("chat");
@@ -112,6 +136,8 @@ function App() {
   const [captures, setCaptures] = useState<ScreenshotCapture[]>([]);
   const [captureLoading, setCaptureLoading] = useState(false);
   const [captureError, setCaptureError] = useState("");
+  const [archiveDataRefreshKey, setArchiveDataRefreshKey] = useState(0);
+  const [dataPanelCollapsed, setDataPanelCollapsed] = useState(false);
 
   async function refreshStatus() {
     setStatusLoading(true);
@@ -142,8 +168,12 @@ function App() {
     void refreshStatus();
   }, []);
 
+  function refreshArchiveDataPanel() {
+    setArchiveDataRefreshKey((current) => current + 1);
+  }
+
   return (
-    <div className="workbench">
+    <div className={`workbench ${dataPanelCollapsed ? "data-panel-collapsed" : ""}`}>
       <aside className="nav">
         <div className="brand">
           <div className="brand-mark">Q</div>
@@ -185,8 +215,12 @@ function App() {
         {activeView === "chat" && (
           <ChatView status={status} statusLoading={statusLoading} onRefreshStatus={refreshStatus} />
         )}
-        {activeView === "corpus" && <CorpusView />}
-        {activeView === "archives" && <ArchivesView onRefreshStatus={refreshStatus} />}
+        {activeView === "corpus" && (
+          <CorpusView onRefreshStatus={refreshStatus} onArchiveDataChanged={refreshArchiveDataPanel} />
+        )}
+        {activeView === "archives" && (
+          <ArchivesView onRefreshStatus={refreshStatus} onArchiveDataChanged={refreshArchiveDataPanel} />
+        )}
         {activeView === "retrieval" && <RetrievalLab />}
         {activeView === "status" && (
           <StatusView
@@ -202,15 +236,10 @@ function App() {
         )}
       </main>
 
-      <StatusInspector
-        status={status}
-        loading={statusLoading}
-        error={statusError}
-        captures={captures}
-        captureLoading={captureLoading}
-        captureError={captureError}
-        onRefresh={refreshStatus}
-        onCapture={handleCapture}
+      <AvailableDataPanel
+        refreshKey={archiveDataRefreshKey}
+        collapsed={dataPanelCollapsed}
+        onToggleCollapsed={() => setDataPanelCollapsed((current) => !current)}
       />
     </div>
   );
@@ -236,6 +265,8 @@ function ChatView({
   const [toolsEnabled, setToolsEnabled] = useState(true);
   const [streamController, setStreamController] = useState<AbortController | null>(null);
   const [error, setError] = useState("");
+  const [modelLoading, setModelLoading] = useState(false);
+  const [modelLoadNote, setModelLoadNote] = useState("");
   const [historyLoading, setHistoryLoading] = useState(false);
   const [savingPrompt, setSavingPrompt] = useState(false);
 
@@ -308,6 +339,25 @@ function ChatView({
       setError(errorMessage(saveError));
     } finally {
       setSavingPrompt(false);
+    }
+  }
+
+  async function loadSelectedModel() {
+    if (!selectedChatModelId) {
+      setError("Choose a chat model to load.");
+      return;
+    }
+    setModelLoading(true);
+    setModelLoadNote("");
+    setError("");
+    try {
+      const result = await loadChatModel(selectedChatModelId);
+      setModelLoadNote(`Loaded ${result.model_id}.`);
+      await onRefreshStatus();
+    } catch (loadError) {
+      setError(errorMessage(loadError));
+    } finally {
+      setModelLoading(false);
     }
   }
 
@@ -424,9 +474,9 @@ function ChatView({
   return (
     <section className="view chat-view">
       <ViewHeader
-        eyebrow="Chat"
-        title="Qwen3.5 chat memory"
-        detail="Persistent conversations, saved system prompt, RAG, and contextual web-search events."
+        eyebrow="RAG Studio"
+        title="Retrieval-first chat workspace"
+        detail="Persistent conversations, saved system prompts, archive-aware RAG, and contextual web-search events."
         actions={
           <button type="button" className="button" onClick={startNewConversation}>
             <Plus size={16} />
@@ -485,7 +535,7 @@ function ChatView({
             </button>
           </div>
 
-          <div className="chat-log" aria-live="polite">
+      <div className="chat-log" aria-live="polite">
         {messages.length === 0 ? (
           <EmptyState icon={MessageSquare} title="No conversation yet" detail="Send a prompt to start a local stream." />
         ) : (
@@ -494,6 +544,7 @@ function ChatView({
       </div>
 
       {error && <InlineError message={error} />}
+      {modelLoadNote && <div className="inline-note">{modelLoadNote}</div>}
 
       <form className="composer" onSubmit={submitChat}>
         <div className="composer-row">
@@ -505,16 +556,31 @@ function ChatView({
               disabled={isStreaming || mainModels.length === 0}
             >
               {mainModels.length === 0 ? (
-                <option value={selectedChatModelId}>{selectedChatModelId || "No chat models found"}</option>
+                <option value="">No chat models found</option>
               ) : (
-                mainModels.map((model) => (
-                  <option key={model.id} value={model.id}>
-                    {formatModelOption(model)}
+                <>
+                  <option value="" disabled>
+                    Choose a chat model...
                   </option>
-                ))
+                  {mainModels.map((model) => (
+                    <option key={model.id} value={model.id}>
+                      {formatModelOption(model)}
+                    </option>
+                  ))}
+                </>
               )}
             </select>
           </label>
+          <button
+            type="button"
+            className="button"
+            onClick={loadSelectedModel}
+            disabled={modelLoading || isStreaming || selectedChatModelId.length === 0}
+            title="Load the selected model in Lemonade"
+          >
+            {modelLoading ? <Loader2 size={16} className="spin" /> : <Wrench size={16} />}
+            Load model
+          </button>
           <button
             type="button"
             className="icon-button"
@@ -577,209 +643,159 @@ function ChatView({
   );
 }
 
-function CorpusView() {
-  const [sources, setSources] = useState<SourceRecord[]>([]);
-  const [documents, setDocuments] = useState<DocumentRecord[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [ingesting, setIngesting] = useState(false);
+function CorpusView({
+  onRefreshStatus,
+  onArchiveDataChanged,
+}: {
+  onRefreshStatus: () => void | Promise<void>;
+  onArchiveDataChanged: () => void;
+}) {
+  const [targetType, setTargetType] = useState<"subreddit" | "user">("subreddit");
+  const [targetName, setTargetName] = useState("");
+  const [startDate, setStartDate] = useState("2005-01-01");
+  const [endDate, setEndDate] = useState("now");
+  const [includePosts, setIncludePosts] = useState(true);
+  const [includeComments, setIncludeComments] = useState(true);
+  const [job, setJob] = useState<RedditImportJob | null>(null);
+  const [starting, setStarting] = useState(false);
   const [error, setError] = useState("");
-  const [jobResult, setJobResult] = useState<IngestionResult | null>(null);
 
-  const [textTitle, setTextTitle] = useState("");
-  const [textUri, setTextUri] = useState("");
-  const [textBody, setTextBody] = useState("");
-  const [pathKind, setPathKind] = useState<"file" | "folder">("file");
-  const [pathValue, setPathValue] = useState("");
-  const [importKind, setImportKind] = useState<"url" | "crawl" | "jsonl">("url");
-  const [importValue, setImportValue] = useState("");
-  const [crawlMaxPages, setCrawlMaxPages] = useState(10);
+  const activeJob = job && !["completed", "failed", "partial"].includes(job.status);
 
-  async function refreshLists() {
-    setLoading(true);
+  async function submitRedditImport(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!targetName.trim()) {
+      setError("Enter a subreddit or user name.");
+      return;
+    }
+    if (!includePosts && !includeComments) {
+      setError("Choose posts, comments, or both.");
+      return;
+    }
+    setStarting(true);
     setError("");
     try {
-      const [nextSources, nextDocuments] = await Promise.all([fetchSources(), fetchDocuments()]);
-      setSources(nextSources);
-      setDocuments(nextDocuments);
-    } catch (listError) {
-      setError(errorMessage(listError));
+      const nextJob = await startRedditImport({
+        target_type: targetType,
+        target_name: targetName.trim(),
+        start_date: startDate.trim() || "2005-01-01",
+        end_date: endDate.trim() || "now",
+        include_posts: includePosts,
+        include_comments: includeComments,
+      });
+      setJob(nextJob);
+      onArchiveDataChanged();
+      await onRefreshStatus();
+    } catch (startError) {
+      setError(errorMessage(startError));
     } finally {
-      setLoading(false);
+      setStarting(false);
     }
-  }
-
-  async function runIngest(payload: IngestPayload) {
-    setIngesting(true);
-    setError("");
-    try {
-      const result = await ingestSource(payload);
-      setJobResult(result);
-      await refreshLists();
-    } catch (ingestError) {
-      setError(errorMessage(ingestError));
-    } finally {
-      setIngesting(false);
-    }
-  }
-
-  function submitText(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!textBody.trim()) {
-      setError("Text ingest requires content.");
-      return;
-    }
-    void runIngest({
-      kind: "text",
-      title: textTitle.trim() || undefined,
-      uri: textUri.trim() || undefined,
-      text: textBody.trim(),
-    });
-  }
-
-  function submitPath(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!pathValue.trim()) {
-      setError("Path ingest requires a local path.");
-      return;
-    }
-    void runIngest({ kind: pathKind, path: pathValue.trim() });
-  }
-
-  function submitImport(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!importValue.trim()) {
-      setError("Import requires a URL or JSONL path.");
-      return;
-    }
-    if (importKind === "jsonl") {
-      void runIngest({ kind: "jsonl", path: importValue.trim() });
-      return;
-    }
-    void runIngest({
-      kind: importKind,
-      url: importValue.trim(),
-      max_pages: importKind === "crawl" ? crawlMaxPages : undefined,
-    });
   }
 
   useEffect(() => {
-    void refreshLists();
-  }, []);
+    if (!job || !activeJob) {
+      return;
+    }
+    const interval = globalThis.setInterval(() => {
+      void fetchRedditImportJob(job.id)
+        .then((nextJob) => {
+          setJob(nextJob);
+          onArchiveDataChanged();
+          if (["completed", "failed", "partial"].includes(nextJob.status)) {
+            void onRefreshStatus();
+          }
+        })
+        .catch((pollError) => setError(errorMessage(pollError)));
+    }, 10_000);
+    return () => globalThis.clearInterval(interval);
+  }, [job, activeJob, onArchiveDataChanged, onRefreshStatus]);
 
   return (
     <section className="view">
       <ViewHeader
         eyebrow="Corpus"
-        title="Ingestion and source inventory"
-        detail="Text, local paths, URLs, crawls, JSONL imports, and the database-backed lists."
-        actions={
-          <button type="button" className="button" onClick={refreshLists} disabled={loading}>
-            <RefreshCw size={16} className={loading ? "spin" : ""} />
-            Refresh
-          </button>
-        }
+        title="Reddit archive download"
+        detail="Download posts and comments, then automatically import, classify, chunk, and embed them for local RAG."
       />
 
       {error && <InlineError message={error} />}
 
-      <div className="form-grid">
-        <form className="panel form-panel" onSubmit={submitText}>
-          <PanelTitle icon={FileText} title="Text ingest" />
-          <label>
-            <span>Title</span>
-            <input value={textTitle} onChange={(event) => setTextTitle(event.target.value)} placeholder="Optional" />
-          </label>
-          <label>
-            <span>URI</span>
-            <input value={textUri} onChange={(event) => setTextUri(event.target.value)} placeholder="Optional stable ID" />
-          </label>
-          <label>
-            <span>Text</span>
-            <textarea value={textBody} onChange={(event) => setTextBody(event.target.value)} rows={7} />
-          </label>
-          <button type="submit" className="button primary" disabled={ingesting}>
-            <Upload size={16} />
-            Ingest text
-          </button>
-        </form>
-
-        <form className="panel form-panel" onSubmit={submitPath}>
-          <PanelTitle icon={FolderOpen} title="File or folder ingest" />
-          <label>
-            <span>Kind</span>
-            <select value={pathKind} onChange={(event) => setPathKind(event.target.value as "file" | "folder")}>
-              <option value="file">file</option>
-              <option value="folder">folder</option>
-            </select>
-          </label>
-          <label>
-            <span>Local path</span>
+      <form className="download-tool panel" onSubmit={submitRedditImport}>
+        <div className="download-tool-head">
+          <div>
+            <PanelTitle icon={Globe} title="Download tool" />
+            <p>
+              Download Reddit posts and comments, then load the archive into the local database with metadata, semantic
+              chunks, and vector embeddings.
+            </p>
+          </div>
+          <Database size={24} />
+        </div>
+        <div className="reddit-target-row">
+          <div className="segmented-control" aria-label="Reddit target type">
+            <button
+              type="button"
+              className={targetType === "subreddit" ? "active" : ""}
+              onClick={() => setTargetType("subreddit")}
+            >
+              r/
+            </button>
+            <button type="button" className={targetType === "user" ? "active" : ""} onClick={() => setTargetType("user")}>
+              u/
+            </button>
+          </div>
+          <label className="grow">
+            <span>{targetType === "subreddit" ? "Subreddit name" : "User name"}</span>
             <input
-              value={pathValue}
-              onChange={(event) => setPathValue(event.target.value)}
-              placeholder="C:\\path\\to\\file-or-folder"
+              value={targetName}
+              onChange={(event) => setTargetName(event.target.value)}
+              placeholder={targetType === "subreddit" ? "theehive" : "username"}
             />
           </label>
-          <button type="submit" className="button primary" disabled={ingesting}>
-            <Upload size={16} />
-            Ingest path
-          </button>
-        </form>
-
-        <form className="panel form-panel" onSubmit={submitImport}>
-          <PanelTitle icon={Globe} title="URL, crawl, or JSONL import" />
+        </div>
+        <div className="date-row">
           <label>
-            <span>Kind</span>
-            <select value={importKind} onChange={(event) => setImportKind(event.target.value as "url" | "crawl" | "jsonl")}>
-              <option value="url">url</option>
-              <option value="crawl">crawl</option>
-              <option value="jsonl">jsonl</option>
-            </select>
+            <span>Start date</span>
+            <input value={startDate} onChange={(event) => setStartDate(event.target.value)} placeholder="2005-01-01" />
           </label>
           <label>
-            <span>{importKind === "jsonl" ? "JSONL path" : "URL"}</span>
+            <span>End date</span>
+            <input value={endDate} onChange={(event) => setEndDate(event.target.value)} placeholder="now" />
+          </label>
+        </div>
+        <div className="download-options">
+          <label className="toggle-row">
+            <input type="checkbox" checked={includePosts} onChange={(event) => setIncludePosts(event.target.checked)} />
+            <span>Download posts</span>
+          </label>
+          <label className="toggle-row">
             <input
-              value={importValue}
-              onChange={(event) => setImportValue(event.target.value)}
-              placeholder={importKind === "jsonl" ? "C:\\path\\to\\pages.jsonl" : "https://example.test/page"}
+              type="checkbox"
+              checked={includeComments}
+              onChange={(event) => setIncludeComments(event.target.checked)}
             />
+            <span>Download comments</span>
           </label>
-          {importKind === "crawl" && (
-            <label>
-              <span>Max pages</span>
-              <input
-                type="number"
-                min={1}
-                max={100}
-                value={crawlMaxPages}
-                onChange={(event) => setCrawlMaxPages(Number(event.target.value))}
-              />
-            </label>
-          )}
-          <button type="submit" className="button primary" disabled={ingesting}>
-            <Upload size={16} />
-            Import
-          </button>
-        </form>
-      </div>
+        </div>
+        <button type="submit" className="button primary" disabled={starting || Boolean(activeJob)}>
+          {starting || activeJob ? <Loader2 size={16} className="spin" /> : <Upload size={16} />}
+          Start
+        </button>
+      </form>
 
-      {jobResult && <JobResult result={jobResult} />}
-
-      <div className="split-grid">
-        <section className="panel">
-          <PanelTitle icon={Database} title={`Sources (${sources.length})`} />
-          <SourceList sources={sources} />
-        </section>
-        <section className="panel">
-          <PanelTitle icon={FileText} title={`Documents (${documents.length})`} />
-          <DocumentList documents={documents} />
-        </section>
-      </div>
+      {job && <RedditImportJobPanel job={job} />}
     </section>
   );
 }
 
-function ArchivesView({ onRefreshStatus }: { onRefreshStatus: () => void | Promise<void> }) {
+function ArchivesView({
+  onRefreshStatus,
+  onArchiveDataChanged,
+}: {
+  onRefreshStatus: () => void | Promise<void>;
+  onArchiveDataChanged: () => void;
+}) {
   const [files, setFiles] = useState<ArchiveFileRecord[]>([]);
   const [coverage, setCoverage] = useState<ArchiveCoverage | null>(null);
   const [loading, setLoading] = useState(false);
@@ -826,6 +842,7 @@ function ArchivesView({ onRefreshStatus }: { onRefreshStatus: () => void | Promi
       setImportResult(result);
       await refreshArchives();
       await onRefreshStatus();
+      onArchiveDataChanged();
     } catch (importError) {
       setError(errorMessage(importError));
     } finally {
@@ -884,9 +901,9 @@ function ArchivesView({ onRefreshStatus }: { onRefreshStatus: () => void | Promi
   return (
     <section className="view">
       <ViewHeader
-        eyebrow="Archives"
-        title="Hybrid Reddit archive index"
-        detail="Exact archive access, corpus coverage, and raw Reddit evidence for hybrid RAG."
+        eyebrow="Archive Management"
+        title="Import, count, and search raw archives"
+        detail="Secondary tools for maintaining the archive store; the live data state stays in the Available Data panel."
         actions={
           <button type="button" className="button" onClick={refreshArchives} disabled={loading}>
             <RefreshCw size={16} className={loading ? "spin" : ""} />
@@ -1077,6 +1094,31 @@ function RetrievalLab() {
 
 function StatusView(props: StatusPanelProps) {
   const { status, loading, error, captures, captureLoading, captureError, onRefresh, onCapture } = props;
+  const [endpointDraft, setEndpointDraft] = useState(status?.lemonade?.base_url ?? "");
+  const [endpointSaving, setEndpointSaving] = useState(false);
+  const [endpointNote, setEndpointNote] = useState("");
+  const [endpointError, setEndpointError] = useState("");
+
+  useEffect(() => {
+    setEndpointDraft(status?.lemonade?.base_url ?? "");
+  }, [status?.lemonade?.base_url]);
+
+  async function saveEndpoint(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setEndpointSaving(true);
+    setEndpointNote("");
+    setEndpointError("");
+    try {
+      const result = await updateProviderSettings(endpointDraft.trim());
+      setEndpointDraft(result.lemonade?.base_url ?? endpointDraft.trim());
+      setEndpointNote("Endpoint saved. Model options refreshed.");
+      await onRefresh();
+    } catch (saveError) {
+      setEndpointError(errorMessage(saveError));
+    } finally {
+      setEndpointSaving(false);
+    }
+  }
 
   return (
     <section className="view">
@@ -1097,6 +1139,23 @@ function StatusView(props: StatusPanelProps) {
           <PanelTitle icon={Activity} title="Lemonade" />
           <KeyValue label="Reachable" value={<StatusPill ok={Boolean(status?.lemonade?.reachable)} />} />
           <KeyValue label="Base URL" value={<code>{status?.lemonade?.base_url ?? "unknown"}</code>} />
+          <form className="endpoint-form" onSubmit={saveEndpoint}>
+            <label>
+              <span>OpenAI-compatible base URL</span>
+              <input
+                value={endpointDraft}
+                onChange={(event) => setEndpointDraft(event.target.value)}
+                placeholder="http://127.0.0.1:13305/v1"
+                disabled={endpointSaving}
+              />
+            </label>
+            <button type="submit" className="button" disabled={endpointSaving}>
+              {endpointSaving ? <Loader2 size={16} className="spin" /> : <Save size={16} />}
+              Save endpoint
+            </button>
+          </form>
+          {endpointNote && <div className="inline-note">{endpointNote}</div>}
+          {endpointError && <InlineError message={endpointError} />}
           {status?.lemonade?.error && <InlineError message={status.lemonade.error} />}
         </section>
         <section className="panel">
@@ -1109,9 +1168,9 @@ function StatusView(props: StatusPanelProps) {
         </section>
         <section className="panel">
           <PanelTitle icon={Wrench} title="Auxiliary models" />
-          <KeyValue label="Embedding" value={<code>{status?.embedding?.id ?? "unknown"}</code>} />
-          <KeyValue label="Reranker" value={<code>{status?.reranker?.id ?? "unknown"}</code>} />
-          <KeyValue label="Classifier" value={<code>{status?.classifier?.id ?? "unknown"}</code>} />
+          <KeyValue label="Embedding" value={<AuxiliaryModelBadge id={status?.embedding?.id} available={status?.embedding?.available} />} />
+          <KeyValue label="Reranker" value={<AuxiliaryModelBadge id={status?.reranker?.id} available={status?.reranker?.available} />} />
+          <KeyValue label="Classifier" value={<AuxiliaryModelBadge id={status?.classifier?.id} available={status?.classifier?.available} />} />
         </section>
         <section className="panel">
           <PanelTitle icon={Database} title="Database counts" />
@@ -1148,38 +1207,278 @@ interface StatusPanelProps {
   onCapture: () => void | Promise<void>;
 }
 
-function StatusInspector(props: StatusPanelProps) {
-  const { status, loading, error, captures, captureLoading, captureError, onRefresh, onCapture } = props;
+function AvailableDataPanel({
+  refreshKey,
+  collapsed,
+  onToggleCollapsed,
+}: {
+  refreshKey: number;
+  collapsed: boolean;
+  onToggleCollapsed: () => void;
+}) {
+  const [subreddits, setSubreddits] = useState<ArchiveSubredditSummary[]>([]);
+  const [coverage, setCoverage] = useState<ArchiveCoverage | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [clearing, setClearing] = useState<Record<string, boolean>>({});
+  const [clearErrors, setClearErrors] = useState<Record<string, string>>({});
+  const [clearNotes, setClearNotes] = useState<Record<string, string>>({});
+  const [clearPanelNote, setClearPanelNote] = useState("");
+  const [activeClearJob, setActiveClearJob] = useState<ArchiveClearJob | null>(null);
+  const [exploring, setExploring] = useState<Record<string, boolean>>({});
+  const [exploreErrors, setExploreErrors] = useState<Record<string, string>>({});
+  const [exploreNotes, setExploreNotes] = useState<Record<string, string>>({});
+
+  async function refreshAvailableData() {
+    setLoading(true);
+    setError("");
+    try {
+      const response = await fetchArchiveSubreddits();
+      setSubreddits(response.subreddits);
+      setCoverage(response.coverage);
+    } catch (listError) {
+      setError(errorMessage(listError));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function clearSubreddit(summary: ArchiveSubredditSummary) {
+    const subreddit = summary.subreddit;
+    const confirmed = globalThis.confirm?.(
+      `Clear r/${subreddit}? This removes its downloaded JSONL, database rows, chunks, embeddings, and generated HTML. Chat history is kept.`,
+    );
+    if (!confirmed) {
+      return;
+    }
+    setClearing((current) => ({ ...current, [subreddit]: true }));
+    setClearErrors((current) => ({ ...current, [subreddit]: "" }));
+    setClearNotes((current) => ({ ...current, [subreddit]: formatClearStartedMessage(subreddit, summary.items) }));
+    setClearPanelNote(formatClearStartedMessage(subreddit, summary.items));
+    try {
+      const job = await startArchiveSubredditClear(subreddit);
+      globalThis.localStorage?.setItem(ACTIVE_CLEAR_JOB_STORAGE_KEY, job.id);
+      applyArchiveClearJob(job);
+    } catch (clearFailure) {
+      setClearPanelNote("");
+      setClearErrors((current) => ({ ...current, [subreddit]: errorMessage(clearFailure) }));
+      setClearing((current) => ({ ...current, [subreddit]: false }));
+    }
+  }
+
+  function applyArchiveClearJob(job: ArchiveClearJob) {
+    setActiveClearJob(job);
+    if (job.status === "queued" || job.status === "running") {
+      setClearing((current) => ({ ...current, [job.subreddit]: true }));
+      setClearErrors((current) => ({ ...current, [job.subreddit]: "" }));
+      setClearNotes((current) => ({ ...current, [job.subreddit]: job.message }));
+      setClearPanelNote(job.message);
+      return;
+    }
+    setClearing((current) => ({ ...current, [job.subreddit]: false }));
+    globalThis.localStorage?.removeItem(ACTIVE_CLEAR_JOB_STORAGE_KEY);
+    if (job.status === "completed" && job.result) {
+      setCoverage(job.result.coverage);
+      setSubreddits((current) => current.filter((item) => item.subreddit !== job.subreddit));
+      setExploreErrors((current) => ({ ...current, [job.subreddit]: "" }));
+      setExploreNotes((current) => ({ ...current, [job.subreddit]: "" }));
+      setClearPanelNote(`Cleared r/${job.result.subreddit}. ${formatPurgeSummary(job.result.deleted)}`);
+      setActiveClearJob(null);
+      return;
+    }
+    if (job.status === "failed") {
+      setClearPanelNote("");
+      setClearErrors((current) => ({ ...current, [job.subreddit]: job.error || "Clear failed." }));
+      setActiveClearJob(null);
+    }
+  }
+
+  async function refreshClearJob(jobId: string) {
+    try {
+      applyArchiveClearJob(await fetchArchiveClearJob(jobId));
+    } catch (jobError) {
+      globalThis.localStorage?.removeItem(ACTIVE_CLEAR_JOB_STORAGE_KEY);
+      setActiveClearJob(null);
+      setClearPanelNote("");
+      setError(errorMessage(jobError));
+    }
+  }
+
+  async function exploreSubreddit(summary: ArchiveSubredditSummary) {
+    const subreddit = summary.subreddit;
+    setExploring((current) => ({ ...current, [subreddit]: true }));
+    setExploreErrors((current) => ({ ...current, [subreddit]: "" }));
+    setExploreNotes((current) => ({ ...current, [subreddit]: "" }));
+    try {
+      const result = await exportArchiveSubredditHtml(subreddit);
+      const opened = openArchiveExportUrl(result.open_url);
+      if (!opened) {
+        setExploreErrors((current) => ({
+          ...current,
+          [subreddit]: "The browser blocked the export tab. The HTML export was created, but it was not opened.",
+        }));
+        return;
+      }
+      setExploreNotes((current) => ({
+        ...current,
+        [subreddit]: `Opened ${formatCount(result.post_count)} posts from ${result.index_path}.`,
+      }));
+    } catch (exportError) {
+      setExploreErrors((current) => ({ ...current, [subreddit]: errorMessage(exportError) }));
+    } finally {
+      setExploring((current) => ({ ...current, [subreddit]: false }));
+    }
+  }
+
+  useEffect(() => {
+    void refreshAvailableData();
+  }, [refreshKey]);
+
+  useEffect(() => {
+    const jobId = globalThis.localStorage?.getItem(ACTIVE_CLEAR_JOB_STORAGE_KEY);
+    if (jobId) {
+      void refreshClearJob(jobId);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!activeClearJob || !["queued", "running"].includes(activeClearJob.status)) {
+      return;
+    }
+    const timeoutId = globalThis.setTimeout(() => void refreshClearJob(activeClearJob.id), 1500);
+    return () => globalThis.clearTimeout(timeoutId);
+  }, [activeClearJob?.id, activeClearJob?.status, activeClearJob?.updated_at]);
 
   return (
-    <aside className="inspector">
-      <div className="inspector-head">
+    <aside className={`available-data ${collapsed ? "collapsed" : ""}`}>
+      <div className="data-panel-head">
         <div>
-          <div className="label">Status</div>
-          <h2>Runtime</h2>
+          <div className="label">Available Data</div>
+          {!collapsed && <h2>Imported subreddits</h2>}
         </div>
-        <button type="button" className="icon-button" onClick={onRefresh} disabled={loading} title="Refresh status">
-          <RefreshCw size={16} className={loading ? "spin" : ""} />
+        <div className="data-panel-actions">
+          {!collapsed && (
+            <button
+              type="button"
+              className="icon-button"
+              onClick={refreshAvailableData}
+              disabled={loading}
+              title="Refresh available data"
+            >
+              <RefreshCw size={16} className={loading ? "spin" : ""} />
+            </button>
+          )}
+          <button
+            type="button"
+            className="icon-button"
+            onClick={onToggleCollapsed}
+            title={collapsed ? "Expand data panel" : "Collapse data panel"}
+          >
+            {collapsed ? <ChevronLeft size={16} /> : <ChevronRight size={16} />}
+          </button>
+        </div>
+      </div>
+
+      {!collapsed && (
+        <>
+          {error && <InlineError message={error} />}
+          {clearPanelNote && <div className="inline-note">{clearPanelNote}</div>}
+          <ArchiveMetricGrid coverage={coverage} compact />
+          <div className="subreddit-list">
+            {subreddits.length === 0 ? (
+              <EmptyState
+                icon={Archive}
+                title="No imported subreddits"
+                detail="Import Reddit archives to populate the retrieval data inventory."
+                compact
+              />
+            ) : (
+              subreddits.map((summary) => (
+                <SubredditDataCard
+                  key={summary.subreddit}
+                  summary={summary}
+                  exploring={Boolean(exploring[summary.subreddit])}
+                  error={exploreErrors[summary.subreddit] || ""}
+                  note={exploreNotes[summary.subreddit] || ""}
+                  clearing={Boolean(clearing[summary.subreddit])}
+                  clearError={clearErrors[summary.subreddit] || ""}
+                  clearNote={clearNotes[summary.subreddit] || ""}
+                  onExplore={() => void exploreSubreddit(summary)}
+                  onClear={() => void clearSubreddit(summary)}
+                />
+              ))
+            )}
+          </div>
+        </>
+      )}
+    </aside>
+  );
+}
+
+function SubredditDataCard({
+  summary,
+  exploring,
+  error,
+  note,
+  clearing,
+  clearError,
+  clearNote,
+  onExplore,
+  onClear,
+}: {
+  summary: ArchiveSubredditSummary;
+  exploring: boolean;
+  error: string;
+  note: string;
+  clearing: boolean;
+  clearError: string;
+  clearNote: string;
+  onExplore: () => void;
+  onClear: () => void;
+}) {
+  const status = archiveImportStatus(summary);
+  const dateRange = formatUtcDateRange(summary.min_created_utc, summary.max_created_utc);
+
+  return (
+    <article className="subreddit-card">
+      <div className="subreddit-card-head">
+        <div>
+          <strong>r/{summary.subreddit || "unknown"}</strong>
+          <span>{dateRange}</span>
+        </div>
+        <StatusPill ok={isReadyArchiveStatus(status)} text={status} />
+      </div>
+      <div className="subreddit-counts">
+        <Metric label="Items" value={formatCount(summary.items)} />
+        <Metric label="Posts" value={formatCount(summary.posts)} />
+        <Metric label="Comments" value={formatCount(summary.comments)} />
+      </div>
+      <div className="subreddit-details">
+        <KeyValue label="Source files" value={formatSourceFiles(summary.source_files)} />
+        <KeyValue label="Latest import" value={formatTime(summary.latest_import_at ?? undefined)} />
+        <KeyValue
+          label="Chunks"
+          value={`${formatCount(summary.semantic_chunks)} semantic / ${formatCount(summary.embedded_items)} embedded`}
+        />
+        <KeyValue label="Models" value={compactListPreview(summary.embedding_model_ids, 2, "none")} />
+        <KeyValue label="Dimensions" value={compactListPreview(summary.embedding_dimensions, 3, "unknown")} />
+        <KeyValue label="Metadata" value={compactListPreview(summary.metadata_fields, 3, "none")} />
+      </div>
+      <div className="subreddit-actions">
+        <button type="button" className="button primary" onClick={onExplore} disabled={exploring || clearing}>
+          {exploring ? <Loader2 size={16} className="spin" /> : <FolderOpen size={16} />}
+          Explore Data
+        </button>
+        <button type="button" className="button danger" onClick={onClear} disabled={clearing || exploring}>
+          {clearing ? <Loader2 size={16} className="spin" /> : <Trash2 size={16} />}
+          {clearing ? "Clearing..." : "Clear"}
         </button>
       </div>
       {error && <InlineError message={error} />}
-      <div className="status-stack">
-        <KeyValue label="Lemonade" value={<StatusPill ok={Boolean(status?.lemonade?.reachable)} />} />
-        <KeyValue label="Model" value={<code>{status?.model?.id ?? "unknown"}</code>} />
-        <KeyValue label="Context" value={formatValue(status?.model?.context_size)} />
-        <KeyValue label="Vision" value={<StatusPill ok={Boolean(status?.vision?.ready)} text={status?.vision?.reason} />} />
-      </div>
-      <MetricGrid database={status?.database} compact />
-      <ArchiveMetricGrid coverage={status?.archive} compact />
-      <CaptureControls
-        status={status}
-        captures={captures}
-        captureLoading={captureLoading}
-        captureError={captureError}
-        onCapture={onCapture}
-        compact
-      />
-    </aside>
+      {note && <div className="inline-note">{note}</div>}
+      {clearError && <InlineError message={clearError} />}
+      {clearNote && <div className="inline-note">{clearNote}</div>}
+    </article>
   );
 }
 
@@ -1429,6 +1728,36 @@ function ArchiveSearchList({ results }: { results: ArchiveSearchResult[] }) {
         </article>
       ))}
     </div>
+  );
+}
+
+function RedditImportJobPanel({ job }: { job: RedditImportJob }) {
+  const counts = job.stage_counts ?? {};
+  const progress = Math.max(0, Math.min(100, Number(job.progress_percent) || 0));
+  return (
+    <section className="panel reddit-job">
+      <div className="inspector-head">
+        <div>
+          <PanelTitle icon={Loader2} title={`Import job ${job.id}: ${job.current_stage}`} />
+          <div className="muted small">
+            {job.status} for {job.target_type}/{job.target_name} · ETA {job.eta_label || "estimating"}
+          </div>
+        </div>
+        <StatusPill ok={job.status === "completed"} text={job.status} />
+      </div>
+      <div className="progress-track" aria-label="Import progress">
+        <div style={{ width: `${progress}%` }} />
+      </div>
+      <div className="metric-grid compact">
+        <Metric label="Progress" value={`${Math.round(progress)}%`} />
+        <Metric label="Downloaded" value={formatCount(counts.downloaded_items)} />
+        <Metric label="Imported" value={formatCount(counts.imported_rows)} />
+        <Metric label="Metadata" value={formatCount(counts.metadata_rows)} />
+        <Metric label="Chunks" value={formatCount(counts.semantic_chunks)} />
+        <Metric label="Embedded" value={formatCount(counts.embedded_chunks)} />
+      </div>
+      {job.log && <pre className="job-log">{job.log}</pre>}
+    </section>
   );
 }
 
@@ -1706,11 +2035,34 @@ function formatScore(score: number): string {
   return score.toFixed(3);
 }
 
+function formatCount(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "0";
+  }
+  return new Intl.NumberFormat().format(value);
+}
+
 function formatValue(value: unknown): string {
   if (value === null || value === undefined || value === "") {
     return "unknown";
   }
   return String(value);
+}
+
+function formatSourceFiles(value: ArchiveSubredditSummary["source_files"]): string {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return `${formatCount(value)} ${value === 1 ? "file" : "files"}`;
+  }
+  return sourceFilePreview(value, 2, "none");
+}
+
+function archiveImportStatus(summary: ArchiveSubredditSummary): string {
+  return summary.latest_import_status || summary.status || "unknown";
+}
+
+function isReadyArchiveStatus(status: string): boolean {
+  const normalized = status.toLowerCase();
+  return ["completed", "complete", "ready", "indexed", "success", "succeeded"].includes(normalized);
 }
 
 function formatModelOption(model: ModelOption): string {
@@ -1731,6 +2083,17 @@ function formatTime(value: string | undefined): string {
 
 function makeId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function AuxiliaryModelBadge({ id, available }: { id?: string; available?: boolean }) {
+  const hasAvailable = available !== undefined;
+  const ok = hasAvailable ? available : undefined;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+      <code>{id ?? "unknown"}</code>
+      {hasAvailable && !ok && <StatusPill ok={false} text="not loaded" />}
+    </div>
+  );
 }
 
 function errorMessage(error: unknown): string {

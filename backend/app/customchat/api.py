@@ -1,20 +1,24 @@
 from __future__ import annotations
 
-import asyncio
 import json
+import re
+import time
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from customchat.archive import ArchiveService, extract_count_term, format_archive_context
 from customchat.config import Settings, settings as default_settings
 from customchat.database import Database
 from customchat.lemonade_client import LemonadeClient
+from customchat.reddit_import import RedditImportPayload, RedditImportService
 from customchat.screenshots import capture_monitor
 from customchat.services import IngestionService, RagService
 from customchat.web_search import WebSearchService, format_web_context, should_use_web_search
@@ -68,6 +72,14 @@ class ChatStreamRequest(BaseModel):
     system_prompt: str = ""
 
 
+class ModelLoadRequest(BaseModel):
+    model_id: str
+
+
+class ProviderSettingsRequest(BaseModel):
+    lemonade_base_url: str
+
+
 class ScreenshotRequest(BaseModel):
     monitor_index: int = 1
 
@@ -89,19 +101,32 @@ class MessageCreateRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class RedditImportRequest(BaseModel):
+    target_type: str
+    target_name: str
+    start_date: str = "2005-01-01"
+    end_date: str = "now"
+    include_posts: bool = True
+    include_comments: bool = True
+
+
 def create_app(
     settings: Settings = default_settings,
     database: Database | None = None,
     lemonade: LemonadeClient | None = None,
     web_search: WebSearchService | None = None,
+    reddit_downloader: Any | None = None,
+    run_reddit_imports_inline: bool = False,
 ) -> FastAPI:
     database = database or Database(settings.database_path)
     database.initialize()
     lemonade = lemonade or LemonadeClient(settings.lemonade_base_url)
+    lemonade_factory = LemonadeClient
     web_search = web_search or WebSearchService()
     ingestion = IngestionService(settings, database, lemonade)
     rag = RagService(settings, database, lemonade)
     archive = ArchiveService(database)
+    reddit_imports = RedditImportService(settings, database, archive, lemonade, downloader=reddit_downloader)
 
     app = FastAPI(title="CustomChat Local Qwen RAG Workbench")
     app.add_middleware(
@@ -114,48 +139,60 @@ def create_app(
     app.state.settings = settings
     app.state.database = database
     app.state.lemonade = lemonade
+    app.state.lemonade_factory = lemonade_factory
+    app.state.loaded_chat_model_id = None
+    app.state.archive_clear_jobs = {}
+    archive_html_dir = settings.artifacts_dir / "archive-html"
+    archive_html_dir.mkdir(parents=True, exist_ok=True)
+    app.mount("/artifacts/archive-html", StaticFiles(directory=archive_html_dir), name="archive-html")
 
     @app.get("/api/status")
     async def status():
+        active_lemonade = app.state.lemonade
         try:
-            models = await lemonade.list_models()
+            models = await active_lemonade.list_models()
             main_models = _main_llm_options(models.get("data", []))
             available_ids = [item.get("id") for item in models.get("data", [])]
-            effective_model_id = (
-                settings.chat_model_id
-                if settings.chat_model_id in available_ids
-                else main_models[0]["id"]
-                if main_models
-                else settings.chat_model_id
-            )
-            model = await lemonade.get_model(effective_model_id)
-            try:
-                vision = await asyncio.wait_for(
-                    lemonade.probe_vision(effective_model_id),
-                    timeout=settings.status_timeout_seconds,
-                )
-                vision_payload = {"ready": vision.ready, "reason": vision.reason, "message": vision.message}
-            except TimeoutError:
-                vision_payload = {
-                    "ready": False,
-                    "reason": "vision_probe_timeout",
-                    "message": "Vision probe exceeded the status timeout.",
-                }
-            recipe_options = model.get("recipe_options", {})
-            return {
-                "lemonade": {"base_url": settings.lemonade_base_url, "reachable": True},
-                "model": {
-                    "id": settings.chat_model_id,
-                    "effective_id": effective_model_id,
-                    "available": settings.chat_model_id in available_ids or model.get("id") == settings.chat_model_id,
-                    "context_size": recipe_options.get("ctx_size"),
+            loaded_model_id = getattr(app.state, "loaded_chat_model_id", None)
+            model_payload = None
+            vision_payload = {
+                "ready": False,
+                "reason": "not_loaded",
+                "message": "Load a chat model to check runtime model details.",
+            }
+            if loaded_model_id and loaded_model_id in available_ids:
+                model = await active_lemonade.get_model(loaded_model_id)
+                recipe_options = model.get("recipe_options", {})
+                model_payload = {
+                    "id": loaded_model_id,
+                    "effective_id": loaded_model_id,
+                    "available": True,
+                    "context_size": model.get("max_context_window") or recipe_options.get("ctx_size"),
                     "backend": recipe_options.get("llamacpp_backend"),
                     "args": recipe_options.get("llamacpp_args"),
-                },
+                }
+                vision_payload = {
+                    "ready": False,
+                    "reason": "not_probed",
+                    "message": "Vision probing is not run automatically from status.",
+                }
+            available_ids_set = set(available_ids)
+            return {
+                "lemonade": {"base_url": settings.lemonade_base_url, "reachable": True},
+                "model": model_payload,
                 "main_models": main_models,
-                "embedding": {"id": settings.embedding_model_id},
-                "reranker": {"id": settings.reranker_model_id},
-                "classifier": {"id": settings.classifier_model_id},
+                "embedding": {
+                    "id": settings.embedding_model_id,
+                    "available": settings.embedding_model_id in available_ids_set,
+                },
+                "reranker": {
+                    "id": settings.reranker_model_id,
+                    "available": settings.reranker_model_id in available_ids_set,
+                },
+                "classifier": {
+                    "id": settings.classifier_model_id,
+                    "available": settings.classifier_model_id in available_ids_set,
+                },
                 "vision": vision_payload,
                 "database": {
                     "sources": database.count_rows("sources"),
@@ -170,6 +207,37 @@ def create_app(
                 "lemonade": {"base_url": settings.lemonade_base_url, "reachable": False, "error": str(exc)},
                 "vision": {"ready": False, "reason": "status_error", "message": str(exc)},
             }
+
+    @app.put("/api/provider-settings")
+    async def update_provider_settings(request: ProviderSettingsRequest):
+        base_url = _normalize_base_url(request.lemonade_base_url)
+        if not base_url:
+            raise HTTPException(status_code=400, detail="Enter an OpenAI-compatible base URL.")
+        settings.lemonade_base_url = base_url
+        active_lemonade = app.state.lemonade_factory(base_url)
+        app.state.lemonade = active_lemonade
+        app.state.loaded_chat_model_id = None
+        ingestion.lemonade = active_lemonade
+        rag.lemonade = active_lemonade
+        reddit_imports.lemonade = active_lemonade
+        return {"lemonade": {"base_url": base_url, "reachable": True}}
+
+    @app.post("/api/models/load")
+    async def load_model(request: ModelLoadRequest):
+        active_lemonade = app.state.lemonade
+        model_id = request.model_id.strip()
+        if not model_id:
+            raise HTTPException(status_code=400, detail="Choose a chat model to load.")
+        models = await active_lemonade.list_models()
+        selectable_ids = {model["id"] for model in _main_llm_options(models.get("data", []))}
+        if model_id not in selectable_ids:
+            raise HTTPException(status_code=404, detail="Chat model not found in fetched model options.")
+        try:
+            result = await active_lemonade.load_chat_model(model_id)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        app.state.loaded_chat_model_id = model_id
+        return {"model_id": model_id, "loaded": True, "result": result}
 
     @app.get("/api/conversations")
     async def conversations():
@@ -227,9 +295,57 @@ def create_app(
     async def archives():
         return {"files": archive.list_files(), "coverage": archive.coverage()}
 
+    @app.get("/api/archives/subreddits")
+    async def archive_subreddits():
+        return {"subreddits": archive.subreddit_summaries(), "coverage": archive.coverage()}
+
+    @app.post("/api/archives/subreddits/{subreddit}/html-export")
+    async def archive_subreddit_html_export(subreddit: str, request: Request):
+        try:
+            result = archive.export_subreddit_html(subreddit, settings.artifacts_dir)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Subreddit not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        html_path = Path(result.artifact_path).relative_to("archive-html").as_posix()
+        return {
+            "subreddit": result.subreddit,
+            "open_url": str(request.url_for("archive-html", path=html_path)),
+            "index_path": result.index_path,
+            "post_count": result.post_count,
+        }
+
+    @app.delete("/api/archives/subreddits/{subreddit}")
+    async def archive_subreddit_delete(subreddit: str, background_tasks: BackgroundTasks, response: Response, background: bool = False):
+        try:
+            if not background:
+                return archive.purge_subreddit(subreddit, settings.artifacts_dir, settings.data_dir)
+            summary = archive.database.get_archive_subreddit_summary(subreddit)
+            if summary is None:
+                raise KeyError(f"Subreddit not found: {subreddit}")
+            job = _create_archive_clear_job(app, summary["subreddit"], int(summary.get("items") or 0))
+            response.status_code = 202
+            background_tasks.add_task(_run_archive_clear_job, app, job["id"], archive, settings.artifacts_dir, settings.data_dir)
+            return job
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Subreddit not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/archive-clear-jobs/{job_id}")
+    async def archive_clear_job(job_id: str):
+        job = app.state.archive_clear_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Clear job not found")
+        return job
+
     @app.post("/api/archives/import")
     async def archive_import(request: ArchiveImportRequest):
         return asdict(archive.import_file(Path(request.path), kind=request.kind))
+
+    @app.post("/api/archives/purge")
+    async def archive_purge():
+        return archive.purge(settings.artifacts_dir)
 
     @app.post("/api/archives/count")
     async def archive_count(request: ArchiveCountRequest):
@@ -256,6 +372,26 @@ def create_app(
             "coverage": archive.coverage(),
         }
 
+    @app.post("/api/reddit-imports")
+    async def reddit_import_start(request: RedditImportRequest, background_tasks: BackgroundTasks):
+        try:
+            job = reddit_imports.create_job(RedditImportPayload(**request.model_dump()))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        job_id = int(job["id"])
+        if run_reddit_imports_inline:
+            await reddit_imports.run_job(job_id)
+        else:
+            background_tasks.add_task(reddit_imports.run_job, job_id)
+        return database.get_reddit_import_job(job_id)
+
+    @app.get("/api/reddit-imports/{job_id}")
+    async def reddit_import_status(job_id: int):
+        job = database.get_reddit_import_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Reddit import job not found")
+        return job
+
     @app.get("/api/sources")
     async def sources():
         return {"sources": database.list_sources()}
@@ -279,8 +415,13 @@ def create_app(
 
     @app.post("/api/chat/stream")
     async def chat_stream(request: ChatStreamRequest):
+        active_lemonade = app.state.lemonade
+        selected_model_id = request.model_id.strip() if request.model_id and request.model_id.strip() else ""
+        if not selected_model_id:
+            raise HTTPException(status_code=400, detail="Choose a chat model before sending.")
+        app.state.loaded_chat_model_id = selected_model_id
+
         async def events():
-            selected_model_id = request.model_id.strip() if request.model_id and request.model_id.strip() else settings.chat_model_id
             conversation_id = request.conversation_id
             if conversation_id is not None and database.get_conversation(conversation_id) is None:
                 raise HTTPException(status_code=404, detail="Conversation not found")
@@ -324,6 +465,7 @@ def create_app(
                     return
 
             rag_context = ""
+            archive_context_used = False
             if request.query:
                 retrieval = await rag.search(request.query, top_k=8)
                 rag_context = retrieval["packed_context"]
@@ -336,16 +478,33 @@ def create_app(
                         {"results": archive_results, "packed_context": archive_context, "coverage": archive.coverage()},
                     )
                     rag_context = "\n\n".join(part for part in [rag_context, archive_context] if part)
+                    archive_context_used = True
+            elif request.tools_enabled and last_user:
+                archive_query = _loaded_archive_query(last_user, database)
+                if archive_query:
+                    archive_results = archive.search(archive_query["query"], limit=12, subreddit=archive_query["subreddit"])
+                    if not archive_results:
+                        archive_results = archive.search("", limit=12, subreddit=archive_query["subreddit"])
+                    if archive_results:
+                        archive_context = format_archive_context(archive_results)
+                        yield _sse(
+                            "archive_context",
+                            {"results": archive_results, "packed_context": archive_context, "coverage": archive.coverage()},
+                        )
+                        rag_context = archive_context
+                        archive_context_used = True
             messages = list(request.messages)
             system_context_parts: list[str] = []
             if request.system_prompt.strip():
                 system_context_parts.append(request.system_prompt.strip())
             if rag_context:
-                system_context_parts.append(
-                    "Use the following retrieved context. Cite chunks with their bracketed IDs.\n\n"
-                    f"{rag_context}"
+                intro = (
+                    "Use the following local Reddit archive datastore context. Cite chunks with their bracketed IDs."
+                    if archive_context_used
+                    else "Use the following retrieved context. Cite chunks with their bracketed IDs."
                 )
-            if request.tools_enabled and last_user and should_use_web_search(last_user):
+                system_context_parts.append(f"{intro}\n\n{rag_context}")
+            if request.tools_enabled and last_user and not archive_context_used and should_use_web_search(last_user):
                 try:
                     web_results = await web_search.search(last_user, max_results=5)
                     yield _sse(
@@ -374,7 +533,7 @@ def create_app(
                 payload["chat_template_kwargs"] = {"enable_thinking": False}
             assistant_content: list[str] = []
             assistant_reasoning: list[str] = []
-            async for raw in lemonade.chat_stream(payload):
+            async for raw in active_lemonade.chat_stream(payload):
                 if raw.get("type") == "done":
                     database.insert_message(
                         conversation_id=conversation_id,
@@ -405,6 +564,49 @@ def create_app(
 
 def _sse(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _normalize_base_url(base_url: str) -> str:
+    normalized = base_url.strip().rstrip("/")
+    if not normalized:
+        return ""
+    if not normalized.startswith(("http://", "https://")):
+        return ""
+    return normalized
+
+
+def _create_archive_clear_job(app: FastAPI, subreddit: str, item_count: int) -> dict[str, Any]:
+    job = {
+        "id": str(uuid.uuid4()),
+        "subreddit": subreddit,
+        "item_count": item_count,
+        "status": "queued",
+        "message": f"Clearing r/{subreddit} {item_count:,} indexed items.",
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "result": None,
+        "error": "",
+    }
+    app.state.archive_clear_jobs[job["id"]] = job
+    return job
+
+
+def _run_archive_clear_job(app: FastAPI, job_id: str, archive: ArchiveService, artifacts_dir: Path, data_dir: Path) -> None:
+    job = app.state.archive_clear_jobs[job_id]
+    job["status"] = "running"
+    job["message"] = f"Clearing r/{job['subreddit']} {job['item_count']:,} indexed items."
+    job["updated_at"] = time.time()
+    try:
+        result = archive.purge_subreddit(job["subreddit"], artifacts_dir, data_dir)
+        job["status"] = "completed"
+        job["result"] = result
+        job["message"] = f"Cleared r/{result['subreddit']}."
+    except Exception as exc:  # noqa: BLE001
+        job["status"] = "failed"
+        job["error"] = str(exc)
+        job["message"] = f"Failed to clear r/{job['subreddit']}."
+    finally:
+        job["updated_at"] = time.time()
 
 
 def _last_user_message(messages: list[dict[str, Any]]) -> str:
@@ -438,6 +640,24 @@ def _archive_count_answer(term: str, exact_count: Any, folded_count: Any) -> str
         by_kind = ", ".join(f"{kind}: {count}" for kind, count in exact_count.by_kind.items())
         parts.append(f"Case-sensitive occurrences by kind: {by_kind}.")
     return " ".join(parts)
+
+
+def _loaded_archive_query(prompt: str, database: Database) -> dict[str, str] | None:
+    lowered = prompt.lower()
+    if not any(marker in lowered for marker in ("subreddit", "datastore", "loaded", "archive", "r/")):
+        return None
+    for summary in database.list_archive_subreddit_summaries():
+        subreddit = str(summary.get("subreddit") or "")
+        if not subreddit:
+            continue
+        if f"r/{subreddit.lower()}" in lowered or subreddit.lower() in lowered:
+            terms = [
+                term
+                for term in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", prompt)
+                if term.lower() not in {"subreddit", "currently", "loaded", "datastore", subreddit.lower()}
+            ]
+            return {"subreddit": subreddit, "query": " ".join(terms[:12]) or subreddit}
+    return None
 
 
 def _main_llm_options(models: list[dict[str, Any]]) -> list[dict[str, Any]]:

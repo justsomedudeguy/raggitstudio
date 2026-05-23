@@ -10,11 +10,12 @@ describe("chooseChatModelId", () => {
     expect(chooseChatModelId("larger-chat", status)).toBe("larger-chat");
   });
 
-  it("falls back to the configured chat model or first available chat model", () => {
-    expect(chooseChatModelId("", statusWithModels("default-chat", ["default-chat", "larger-chat"]))).toBe(
-      "default-chat",
-    );
-    expect(chooseChatModelId("stale-chat", statusWithModels("missing-chat", ["larger-chat"]))).toBe("larger-chat");
+  it("does not choose a model before the user explicitly selects one", () => {
+    expect(chooseChatModelId("", statusWithModels("default-chat", ["default-chat", "larger-chat"]))).toBe("");
+  });
+
+  it("clears stale selected models instead of falling back to another option", () => {
+    expect(chooseChatModelId("stale-chat", statusWithModels("default-chat", ["default-chat", "larger-chat"]))).toBe("");
   });
 });
 

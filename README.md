@@ -58,21 +58,30 @@ the current code, but the base URL may be any OpenAI-compatible `/v1` endpoint.
 
 ## Run
 
-Terminal 1:
+Start both the backend and frontend from the project root:
 
 ```powershell
-$env:PYTHONPATH='backend/app'
-.\.venv\Scripts\python.exe -m uvicorn main:app --app-dir backend/app --host 127.0.0.1 --port 8000 --reload
+npm install
+npm run dev
 ```
 
-Terminal 2:
-
-```powershell
-cd frontend
-npm run dev -- --host 127.0.0.1
-```
+This launches the FastAPI backend on port 8000 and the Vite dev server on port 5173 in parallel.
 
 Open `http://127.0.0.1:5173`.
+
+### Individual services
+
+Run only the backend:
+
+```powershell
+npm run dev:backend
+```
+
+Run only the frontend:
+
+```powershell
+npm run dev:frontend
+```
 
 ## Archive Workflow
 

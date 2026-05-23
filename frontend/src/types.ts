@@ -19,6 +19,20 @@ export interface ChatStreamRequest {
   system_prompt?: string;
 }
 
+export interface ModelLoadResponse {
+  model_id: string;
+  loaded: boolean;
+  result?: unknown;
+}
+
+export interface ProviderSettingsResponse {
+  lemonade?: {
+    base_url?: string;
+    reachable: boolean;
+    error?: string;
+  };
+}
+
 export interface SseFrame<T = unknown> {
   event: string;
   data: T;
@@ -65,6 +79,89 @@ export interface ArchiveCoverage {
   comments: number;
   semantic_chunks: number;
   embedded_items: number;
+}
+
+export interface ArchiveSubredditSummary extends JsonRecord {
+  subreddit: string;
+  items: number;
+  posts: number;
+  comments: number;
+  min_created_utc?: number | null;
+  max_created_utc?: number | null;
+  source_files?: string[] | number | string | null;
+  latest_import_at?: string | null;
+  latest_import_status?: string | null;
+  status?: string | null;
+  semantic_chunks: number;
+  embedded_items: number;
+  embedding_model_ids?: string[] | string | null;
+  embedding_dimensions?: number[] | number | string | null;
+  metadata_fields?: string[] | string | null;
+}
+
+export interface ArchiveSubredditListResponse {
+  subreddits: ArchiveSubredditSummary[];
+  coverage: ArchiveCoverage;
+}
+
+export interface ArchiveHtmlExportResponse {
+  subreddit: string;
+  open_url: string;
+  index_path: string;
+  post_count: number;
+}
+
+export interface ArchivePurgeResponse {
+  deleted: Record<string, number>;
+  removed_archive_html: boolean;
+  coverage: ArchiveCoverage;
+}
+
+export interface ArchiveSubredditDeleteResponse {
+  subreddit: string;
+  deleted: Record<string, number>;
+  removed_files: string[];
+  skipped_files: string[];
+  removed_archive_html: boolean;
+  coverage: ArchiveCoverage;
+}
+
+export interface ArchiveClearJob {
+  id: string;
+  subreddit: string;
+  item_count: number;
+  status: "queued" | "running" | "completed" | "failed";
+  message: string;
+  created_at: number;
+  updated_at: number;
+  result?: ArchiveSubredditDeleteResponse | null;
+  error?: string;
+}
+
+export interface RedditImportRequest {
+  target_type: "subreddit" | "user";
+  target_name: string;
+  start_date: string;
+  end_date: string;
+  include_posts: boolean;
+  include_comments: boolean;
+}
+
+export interface RedditImportJob extends JsonRecord {
+  id: number;
+  target_type: string;
+  target_name: string;
+  status: string;
+  current_stage: string;
+  payload?: JsonRecord;
+  stage_counts?: Record<string, number>;
+  progress_percent: number;
+  eta_seconds?: number | null;
+  eta_label: string;
+  log?: string;
+  created_at?: string;
+  updated_at?: string;
+  finished_at?: string | null;
 }
 
 export interface ArchiveFileRecord extends JsonRecord {
@@ -190,16 +287,19 @@ export interface StatusResponse {
     context_size?: number | null;
     backend?: string | null;
     args?: string | null;
-  };
+  } | null;
   main_models?: ModelOption[];
   embedding?: {
     id: string;
+    available?: boolean;
   };
   reranker?: {
     id: string;
+    available?: boolean;
   };
   classifier?: {
     id: string;
+    available?: boolean;
   };
   vision?: {
     ready: boolean;

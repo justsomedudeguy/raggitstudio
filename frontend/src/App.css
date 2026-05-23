@@ -56,12 +56,18 @@ pre {
 
 .workbench {
   display: grid;
-  grid-template-columns: 224px minmax(0, 1fr) 330px;
+  grid-template-columns: minmax(196px, 224px) minmax(0, 1fr) minmax(312px, 360px);
   min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.workbench.data-panel-collapsed {
+  grid-template-columns: minmax(196px, 224px) minmax(0, 1fr) 54px;
 }
 
 .nav,
-.inspector {
+.available-data {
   background: #f9fafb;
   border-color: var(--border);
   border-style: solid;
@@ -76,15 +82,25 @@ pre {
   padding: 14px 12px;
 }
 
-.inspector {
+.available-data {
   border-width: 0 0 0 1px;
   padding: 14px;
+}
+
+.available-data.collapsed {
+  padding: 12px 8px;
+  overflow: hidden;
+}
+
+.available-data.collapsed .data-panel-head > div:first-child {
+  display: none;
 }
 
 .main {
   min-width: 0;
   padding: 18px;
-  overflow: hidden;
+  min-height: 0;
+  overflow: auto;
 }
 
 .brand {
@@ -191,7 +207,7 @@ pre {
 }
 
 .view-header h1,
-.inspector h2,
+.available-data h2,
 .panel-title h2 {
   margin: 0;
 }
@@ -261,6 +277,12 @@ pre {
 }
 
 .button.danger {
+  background: var(--danger-bg);
+  border-color: #f0b8b2;
+  color: var(--danger);
+}
+
+.icon-button.danger {
   background: var(--danger-bg);
   border-color: #f0b8b2;
   color: var(--danger);
@@ -522,6 +544,7 @@ select:focus {
 .composer-row {
   display: flex;
   align-items: flex-end;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
@@ -535,6 +558,7 @@ select:focus {
 }
 
 .composer-row textarea {
+  flex: 1 1 420px;
   min-height: 92px;
 }
 
@@ -569,6 +593,105 @@ select:focus {
   display: flex;
   flex-direction: column;
   gap: 9px;
+}
+
+.endpoint-form {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.endpoint-form .button {
+  justify-self: start;
+}
+
+.download-tool {
+  display: grid;
+  gap: 16px;
+  max-width: 760px;
+  background: #202020;
+  color: #f4f4f4;
+  border-color: #3a3a3a;
+}
+
+.download-tool .panel-title {
+  color: #f4f4f4;
+  padding-bottom: 6px;
+}
+
+.download-tool p {
+  margin: 0;
+  max-width: 680px;
+  color: #f0f0f0;
+  line-height: 1.45;
+}
+
+.download-tool label {
+  color: #f4f4f4;
+}
+
+.download-tool input {
+  background: #2b2b2b;
+  border-color: #3f3f3f;
+  color: #ffffff;
+}
+
+.download-tool-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.reddit-target-row,
+.date-row,
+.download-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: end;
+}
+
+.date-row label {
+  flex: 1 1 220px;
+}
+
+.segmented-control {
+  display: inline-flex;
+  align-items: stretch;
+  overflow: hidden;
+  border: 1px solid #555;
+  border-radius: 7px;
+  min-height: 34px;
+}
+
+.segmented-control button {
+  width: 42px;
+  border: 0;
+  background: #2c2c2c;
+  color: #f4f4f4;
+  font-weight: 800;
+}
+
+.segmented-control button.active {
+  background: #737373;
+}
+
+.reddit-job {
+  max-width: 760px;
+}
+
+.progress-track {
+  height: 10px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #eef3f4;
+}
+
+.progress-track div {
+  height: 100%;
+  background: var(--accent);
+  transition: width 180ms ease;
 }
 
 .split-grid,
@@ -718,8 +841,94 @@ select:focus {
   border-bottom: 1px solid var(--border);
 }
 
-.inspector h2 {
+.available-data h2 {
   font-size: 20px;
+}
+
+.data-panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 12px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.data-panel-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.subreddit-list {
+  display: grid;
+  gap: 10px;
+}
+
+.subreddit-card {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 8px;
+  padding: 10px;
+  box-shadow: var(--shadow);
+}
+
+.subreddit-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.subreddit-card-head div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.subreddit-card-head strong {
+  overflow-wrap: anywhere;
+}
+
+.subreddit-card-head span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.subreddit-counts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.subreddit-counts .metric {
+  padding: 7px;
+}
+
+.subreddit-counts .metric strong {
+  font-size: 15px;
+}
+
+.subreddit-details {
+  display: grid;
+  gap: 2px;
+}
+
+.subreddit-details .kv {
+  grid-template-columns: 90px minmax(0, 1fr);
+  padding: 5px 0;
+}
+
+.subreddit-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.subreddit-actions .button {
+  min-width: 0;
 }
 
 .kv {
@@ -938,10 +1147,24 @@ select:focus {
 @media (max-width: 1180px) {
   .workbench {
     grid-template-columns: 204px minmax(0, 1fr);
+    height: auto;
+    overflow: visible;
   }
 
-  .inspector {
-    display: none;
+  .workbench.data-panel-collapsed {
+    grid-template-columns: 204px minmax(0, 1fr);
+  }
+
+  .available-data {
+    grid-column: 1 / -1;
+    position: static;
+    height: auto;
+    max-height: none;
+    border-width: 1px 0 0;
+  }
+
+  .available-data.collapsed {
+    padding: 8px 12px;
   }
 
   .form-grid,
@@ -963,6 +1186,10 @@ select:focus {
     grid-template-columns: 1fr;
   }
 
+  .workbench.data-panel-collapsed {
+    grid-template-columns: 1fr;
+  }
+
   .nav {
     position: static;
     height: auto;
@@ -977,11 +1204,21 @@ select:focus {
     padding: 12px;
   }
 
+  .available-data {
+    border-width: 1px 0 0;
+    padding: 12px;
+  }
+
   .view-header,
   .composer-row,
-  .retrieval-form {
+  .date-row,
+  .download-options,
+  .reddit-target-row,
+  .retrieval-form,
+  .system-prompt {
     flex-direction: column;
     align-items: stretch;
+    grid-template-columns: 1fr;
   }
 
   .composer-actions,
@@ -995,5 +1232,9 @@ select:focus {
 
   .record-meta {
     justify-content: flex-start;
+  }
+
+  .subreddit-actions {
+    grid-template-columns: 1fr;
   }
 }

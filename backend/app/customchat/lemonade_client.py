@@ -127,6 +127,19 @@ class LemonadeClient:
         async for event in self.http.stream_sse("/chat/completions", payload):
             yield event
 
+    async def load_chat_model(self, model_id: str) -> dict[str, Any]:
+        payload = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": "Reply OK."}],
+            "temperature": 0,
+            "max_tokens": 1,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        response = await self.http.post_json("/chat/completions", payload)
+        if "error" in response:
+            raise RuntimeError(_error_message(response["error"]))
+        return response
+
 
 def _error_message(error: Any) -> str:
     if isinstance(error, str):

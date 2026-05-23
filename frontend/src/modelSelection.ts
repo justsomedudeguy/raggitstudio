@@ -5,9 +5,5 @@ export function chooseChatModelId(currentModelId: string, status: StatusResponse
   if (currentModelId && modelIds.includes(currentModelId)) {
     return currentModelId;
   }
-  const configuredId = status?.model?.id ?? "";
-  if (configuredId && modelIds.includes(configuredId)) {
-    return configuredId;
-  }
-  return modelIds[0] ?? configuredId;
+  return "";
 }

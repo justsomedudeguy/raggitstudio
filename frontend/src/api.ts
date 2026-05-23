@@ -6,6 +6,11 @@ import type {
   ArchiveListResponse,
   ArchiveSearchRequest,
   ArchiveSearchResponse,
+  ArchiveHtmlExportResponse,
+  ArchivePurgeResponse,
+  ArchiveClearJob,
+  ArchiveSubredditDeleteResponse,
+  ArchiveSubredditListResponse,
   ChatStreamRequest,
   ConversationDetail,
   ConversationMessage,
@@ -13,8 +18,12 @@ import type {
   DocumentRecord,
   IngestPayload,
   IngestionResult,
+  ModelLoadResponse,
+  ProviderSettingsResponse,
   RagSearchRequest,
   RagSearchResponse,
+  RedditImportJob,
+  RedditImportRequest,
   ScreenshotCapture,
   SourceRecord,
   SseFrame,
@@ -45,6 +54,20 @@ export function parseSseFrames(input: string): SseFrame[] {
 
 export async function fetchStatus(): Promise<StatusResponse> {
   return apiFetch<StatusResponse>("/api/status");
+}
+
+export async function loadChatModel(modelId: string): Promise<ModelLoadResponse> {
+  return apiFetch<ModelLoadResponse>("/api/models/load", {
+    method: "POST",
+    body: JSON.stringify({ model_id: modelId }),
+  });
+}
+
+export async function updateProviderSettings(lemonadeBaseUrl: string): Promise<ProviderSettingsResponse> {
+  return apiFetch<ProviderSettingsResponse>("/api/provider-settings", {
+    method: "PUT",
+    body: JSON.stringify({ lemonade_base_url: lemonadeBaseUrl }),
+  });
 }
 
 export async function ingestSource(payload: IngestPayload): Promise<IngestionResult> {
@@ -115,6 +138,49 @@ export async function searchRag(payload: RagSearchRequest): Promise<RagSearchRes
 
 export async function fetchArchives(): Promise<ArchiveListResponse> {
   return apiFetch<ArchiveListResponse>("/api/archives");
+}
+
+export async function fetchArchiveSubreddits(): Promise<ArchiveSubredditListResponse> {
+  return apiFetch<ArchiveSubredditListResponse>("/api/archives/subreddits");
+}
+
+export async function exportArchiveSubredditHtml(subreddit: string): Promise<ArchiveHtmlExportResponse> {
+  return apiFetch<ArchiveHtmlExportResponse>(`/api/archives/subreddits/${encodeURIComponent(subreddit)}/html-export`, {
+    method: "POST",
+  });
+}
+
+export async function purgeArchives(): Promise<ArchivePurgeResponse> {
+  return apiFetch<ArchivePurgeResponse>("/api/archives/purge", {
+    method: "POST",
+  });
+}
+
+export async function deleteArchiveSubreddit(subreddit: string): Promise<ArchiveSubredditDeleteResponse> {
+  return apiFetch<ArchiveSubredditDeleteResponse>(`/api/archives/subreddits/${encodeURIComponent(subreddit)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function startArchiveSubredditClear(subreddit: string): Promise<ArchiveClearJob> {
+  return apiFetch<ArchiveClearJob>(`/api/archives/subreddits/${encodeURIComponent(subreddit)}?background=true`, {
+    method: "DELETE",
+  });
+}
+
+export async function fetchArchiveClearJob(jobId: string): Promise<ArchiveClearJob> {
+  return apiFetch<ArchiveClearJob>(`/api/archive-clear-jobs/${encodeURIComponent(jobId)}`);
+}
+
+export async function startRedditImport(payload: RedditImportRequest): Promise<RedditImportJob> {
+  return apiFetch<RedditImportJob>("/api/reddit-imports", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function fetchRedditImportJob(jobId: number): Promise<RedditImportJob> {
+  return apiFetch<RedditImportJob>(`/api/reddit-imports/${jobId}`);
 }
 
 export async function importArchive(payload: ArchiveImportPayload): Promise<ArchiveImportResult> {

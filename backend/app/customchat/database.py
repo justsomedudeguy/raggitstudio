@@ -336,7 +336,19 @@ class Database:
                 """
             ).fetchone()
             chunks = db.execute("SELECT COUNT(*) AS count FROM archive_semantic_chunks").fetchone()
-            embedded = db.execute("SELECT COUNT(DISTINCT item_id) AS count FROM archive_semantic_chunks").fetchone()
+            embedded = db.execute(
+                """
+                SELECT COUNT(
+                    DISTINCT CASE
+                        WHEN ase.id IS NOT NULL
+                            OR (sc.embedding_model_id IS NOT NULL AND sc.embedding_model_id != '')
+                        THEN sc.item_id
+                    END
+                ) AS count
+                FROM archive_semantic_chunks sc
+                LEFT JOIN archive_semantic_embeddings ase ON ase.semantic_chunk_id = sc.id
+                """
+            ).fetchone()
         return {
             "files": int(row["files"] or 0),
             "items": int(row["items"] or 0),
@@ -345,6 +357,419 @@ class Database:
             "semantic_chunks": int(chunks["count"] or 0),
             "embedded_items": int(embedded["count"] or 0),
         }
+
+    def create_reddit_import_job(self, payload: dict[str, Any]) -> int:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                INSERT INTO reddit_import_jobs(
+                    target_type, target_name, status, current_stage, payload_json, stage_counts_json,
+                    progress_percent, eta_label
+                )
+                VALUES (?, ?, 'queued', 'queued', ?, '{}', 0, 'estimating')
+                """,
+                (
+                    str(payload.get("target_type") or ""),
+                    str(payload.get("target_name") or ""),
+                    _json(payload),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def update_reddit_import_job(
+        self,
+        job_id: int,
+        *,
+        status: str,
+        current_stage: str,
+        stage_counts: dict[str, Any] | None = None,
+        progress_percent: int | float | None = None,
+        eta_seconds: int | None = None,
+        eta_label: str | None = None,
+        log: str | None = None,
+        finished: bool = False,
+    ) -> None:
+        assignments = [
+            "status=?",
+            "current_stage=?",
+            "updated_at=CURRENT_TIMESTAMP",
+        ]
+        values: list[Any] = [status, current_stage]
+        if stage_counts is not None:
+            assignments.append("stage_counts_json=?")
+            values.append(_json(stage_counts))
+        if progress_percent is not None:
+            assignments.append("progress_percent=?")
+            values.append(max(0, min(100, float(progress_percent))))
+        if eta_seconds is not None:
+            assignments.append("eta_seconds=?")
+            values.append(eta_seconds)
+        if eta_label is not None:
+            assignments.append("eta_label=?")
+            values.append(eta_label)
+        if log is not None:
+            assignments.append("log=?")
+            values.append(log)
+        if finished:
+            assignments.append("finished_at=CURRENT_TIMESTAMP")
+        values.append(job_id)
+        with self.connect() as db:
+            db.execute(f"UPDATE reddit_import_jobs SET {', '.join(assignments)} WHERE id=?", values)
+
+    def get_reddit_import_job(self, job_id: int) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM reddit_import_jobs WHERE id = ?", (job_id,)).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def archive_subreddits_for_paths(self, paths: list[str]) -> list[str]:
+        if not paths:
+            return []
+        placeholders = ",".join("?" for _ in paths)
+        with self.connect() as db:
+            rows = db.execute(
+                f"""
+                SELECT DISTINCT LOWER(ri.subreddit) AS subreddit
+                FROM reddit_items ri
+                JOIN archive_files af ON af.id = ri.archive_file_id
+                WHERE af.path IN ({placeholders}) AND TRIM(ri.subreddit) != ''
+                ORDER BY LOWER(ri.subreddit)
+                """,
+                paths,
+            ).fetchall()
+        return [str(row["subreddit"]) for row in rows]
+
+    def list_reddit_items_for_subreddit(self, subreddit: str) -> list[dict[str, Any]]:
+        normalized = _normalize_subreddit(subreddit)
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT *
+                FROM reddit_items
+                WHERE LOWER(subreddit) = LOWER(?)
+                ORDER BY kind DESC, created_utc IS NULL, created_utc ASC, id ASC
+                """,
+                (normalized,),
+            ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def update_reddit_item_meta(self, item_id: int, meta: dict[str, Any]) -> None:
+        with self.connect() as db:
+            db.execute("UPDATE reddit_items SET meta_json=? WHERE id=?", (_json(meta), item_id))
+
+    def delete_archive_semantic_for_subreddit(self, subreddit: str) -> None:
+        normalized = _normalize_subreddit(subreddit)
+        with self.connect() as db:
+            db.execute(
+                """
+                DELETE FROM archive_semantic_chunks
+                WHERE item_id IN (
+                    SELECT id FROM reddit_items WHERE LOWER(subreddit) = LOWER(?)
+                )
+                """,
+                (normalized,),
+            )
+
+    def upsert_archive_semantic_chunk(
+        self,
+        item_id: int,
+        chunk_index: int,
+        citation_id: str,
+        text: str,
+        metadata: dict[str, Any],
+    ) -> int:
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO archive_semantic_chunks(item_id, chunk_index, citation_id, text, metadata_json)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(item_id, chunk_index) DO UPDATE SET
+                    citation_id=excluded.citation_id,
+                    text=excluded.text,
+                    metadata_json=excluded.metadata_json
+                """,
+                (item_id, chunk_index, citation_id, text, _json(metadata)),
+            )
+            row = db.execute(
+                "SELECT id FROM archive_semantic_chunks WHERE item_id=? AND chunk_index=?",
+                (item_id, chunk_index),
+            ).fetchone()
+            return int(row["id"])
+
+    def insert_archive_embedding(self, semantic_chunk_id: int, model_id: str, vector: Iterable[float]) -> int:
+        values = list(vector)
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                INSERT INTO archive_semantic_embeddings(semantic_chunk_id, model_id, dimensions, vector_blob)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(semantic_chunk_id, model_id) DO UPDATE SET
+                    dimensions=excluded.dimensions,
+                    vector_blob=excluded.vector_blob,
+                    created_at=CURRENT_TIMESTAMP
+                """,
+                (semantic_chunk_id, model_id, len(values), vector_to_blob(values)),
+            )
+            db.execute(
+                """
+                UPDATE archive_semantic_chunks
+                SET embedding_model_id=?, embedding_dimensions=?
+                WHERE id=?
+                """,
+                (model_id, len(values), semantic_chunk_id),
+            )
+            return int(cursor.lastrowid or semantic_chunk_id)
+
+    def all_archive_embeddings(self) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT
+                    ase.semantic_chunk_id,
+                    ase.model_id,
+                    ase.dimensions,
+                    ase.vector_blob,
+                    sc.citation_id,
+                    sc.text,
+                    sc.metadata_json,
+                    ri.id AS item_id,
+                    ri.kind,
+                    ri.subreddit,
+                    ri.author,
+                    ri.score,
+                    ri.title,
+                    ri.permalink
+                FROM archive_semantic_embeddings ase
+                JOIN archive_semantic_chunks sc ON sc.id = ase.semantic_chunk_id
+                JOIN reddit_items ri ON ri.id = sc.item_id
+                """
+            ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def get_archive_semantic_chunks(self, chunk_ids: list[int]) -> list[dict[str, Any]]:
+        if not chunk_ids:
+            return []
+        placeholders = ",".join("?" for _ in chunk_ids)
+        with self.connect() as db:
+            rows = db.execute(
+                f"""
+                SELECT
+                    sc.*,
+                    ri.kind,
+                    ri.subreddit,
+                    ri.author,
+                    ri.score,
+                    ri.title,
+                    ri.permalink
+                FROM archive_semantic_chunks sc
+                JOIN reddit_items ri ON ri.id = sc.item_id
+                WHERE sc.id IN ({placeholders})
+                """,
+                chunk_ids,
+            ).fetchall()
+        by_id = {int(row["id"]): _row_to_dict(row) for row in rows}
+        return [by_id[chunk_id] for chunk_id in chunk_ids if chunk_id in by_id]
+
+    def purge_subreddit_data(self, subreddit: str) -> dict[str, Any]:
+        normalized = _normalize_subreddit(subreddit)
+        with self.connect() as db:
+            path_rows = db.execute(
+                """
+                SELECT DISTINCT af.path
+                FROM archive_files af
+                JOIN reddit_items ri ON ri.archive_file_id = af.id
+                WHERE LOWER(ri.subreddit) = LOWER(?)
+                ORDER BY af.path
+                """,
+                (normalized,),
+            ).fetchall()
+            paths = [str(row["path"]) for row in path_rows]
+
+            source_ids: set[int] = set()
+            for path in paths:
+                rows = db.execute(
+                    """
+                    SELECT DISTINCT s.id
+                    FROM sources s
+                    LEFT JOIN source_artifacts sa ON sa.source_id = s.id
+                    WHERE s.uri = ?
+                        OR s.uri LIKE ?
+                        OR sa.path = ?
+                        OR sa.path LIKE ?
+                    """,
+                    (path, f"{path}#%", path, f"{path}#%"),
+                ).fetchall()
+                source_ids.update(int(row["id"]) for row in rows)
+
+            counts = {
+                "archive_files": 0,
+                "reddit_items": int(
+                    db.execute(
+                        "SELECT COUNT(*) FROM reddit_items WHERE LOWER(subreddit) = LOWER(?)",
+                        (normalized,),
+                    ).fetchone()[0]
+                ),
+                "archive_semantic_chunks": int(
+                    db.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM archive_semantic_chunks sc
+                        JOIN reddit_items ri ON ri.id = sc.item_id
+                        WHERE LOWER(ri.subreddit) = LOWER(?)
+                        """,
+                        (normalized,),
+                    ).fetchone()[0]
+                ),
+                "archive_embeddings": int(
+                    db.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM archive_semantic_embeddings ase
+                        JOIN archive_semantic_chunks sc ON sc.id = ase.semantic_chunk_id
+                        JOIN reddit_items ri ON ri.id = sc.item_id
+                        WHERE LOWER(ri.subreddit) = LOWER(?)
+                        """,
+                        (normalized,),
+                    ).fetchone()[0]
+                ),
+                "corpus_sources": len(source_ids),
+                "corpus_documents": 0,
+                "corpus_chunks": 0,
+                "corpus_embeddings": 0,
+            }
+            if source_ids:
+                placeholders = ",".join("?" for _ in source_ids)
+                ids = list(source_ids)
+                counts["corpus_documents"] = int(
+                    db.execute(f"SELECT COUNT(*) FROM documents WHERE source_id IN ({placeholders})", ids).fetchone()[0]
+                )
+                counts["corpus_chunks"] = int(
+                    db.execute(f"SELECT COUNT(*) FROM chunks WHERE source_id IN ({placeholders})", ids).fetchone()[0]
+                )
+                counts["corpus_embeddings"] = int(
+                    db.execute(
+                        f"""
+                        SELECT COUNT(*)
+                        FROM embeddings e
+                        JOIN chunks c ON c.id = e.chunk_id
+                        WHERE c.source_id IN ({placeholders})
+                        """,
+                        ids,
+                    ).fetchone()[0]
+                )
+                db.execute(f"DELETE FROM sources WHERE id IN ({placeholders})", ids)
+
+            db.execute("DELETE FROM reddit_items WHERE LOWER(subreddit) = LOWER(?)", (normalized,))
+            empty_file_ids = db.execute(
+                """
+                SELECT af.id
+                FROM archive_files af
+                LEFT JOIN reddit_items ri ON ri.archive_file_id = af.id
+                WHERE ri.id IS NULL
+                """
+            ).fetchall()
+            if empty_file_ids:
+                ids = [int(row["id"]) for row in empty_file_ids]
+                placeholders = ",".join("?" for _ in ids)
+                counts["archive_files"] = len(ids)
+                db.execute(f"DELETE FROM archive_files WHERE id IN ({placeholders})", ids)
+            db.execute("INSERT INTO reddit_items_fts(reddit_items_fts) VALUES('rebuild')")
+            return {"deleted": counts, "source_files": paths}
+
+    def purge_loaded_data(self) -> dict[str, int]:
+        with self.connect() as db:
+            counts = {
+                "archive_files": int(db.execute("SELECT COUNT(*) FROM archive_files").fetchone()[0]),
+                "reddit_items": int(db.execute("SELECT COUNT(*) FROM reddit_items").fetchone()[0]),
+                "archive_semantic_chunks": int(db.execute("SELECT COUNT(*) FROM archive_semantic_chunks").fetchone()[0]),
+                "archive_embeddings": int(db.execute("SELECT COUNT(*) FROM archive_semantic_embeddings").fetchone()[0]),
+                "corpus_sources": int(db.execute("SELECT COUNT(*) FROM sources").fetchone()[0]),
+                "corpus_documents": int(db.execute("SELECT COUNT(*) FROM documents").fetchone()[0]),
+                "corpus_chunks": int(db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]),
+                "corpus_embeddings": int(db.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]),
+                "corpus_source_artifacts": int(db.execute("SELECT COUNT(*) FROM source_artifacts").fetchone()[0]),
+                "ingestion_jobs": int(db.execute("SELECT COUNT(*) FROM ingestion_jobs").fetchone()[0]),
+                "reddit_import_jobs": int(db.execute("SELECT COUNT(*) FROM reddit_import_jobs").fetchone()[0]),
+                "retrieval_runs": int(db.execute("SELECT COUNT(*) FROM retrieval_runs").fetchone()[0]),
+            }
+            db.execute("DELETE FROM sources")
+            db.execute("DELETE FROM archive_semantic_embeddings")
+            db.execute("DELETE FROM archive_semantic_chunks")
+            db.execute("DELETE FROM reddit_items")
+            db.execute("DELETE FROM archive_files")
+            db.execute("DELETE FROM ingestion_jobs")
+            db.execute("DELETE FROM reddit_import_jobs")
+            db.execute("DELETE FROM retrieval_runs")
+            db.execute("INSERT INTO reddit_items_fts(reddit_items_fts) VALUES('rebuild')")
+            return counts
+
+    def list_archive_subreddit_summaries(self) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT
+                    LOWER(subreddit) AS subreddit_key,
+                    COUNT(*) AS items,
+                    SUM(CASE WHEN kind='post' THEN 1 ELSE 0 END) AS posts,
+                    SUM(CASE WHEN kind='comment' THEN 1 ELSE 0 END) AS comments,
+                    MIN(created_utc) AS min_created_utc,
+                    MAX(created_utc) AS max_created_utc
+                FROM reddit_items
+                WHERE TRIM(subreddit) != ''
+                GROUP BY LOWER(subreddit)
+                ORDER BY LOWER(subreddit)
+                """
+            ).fetchall()
+            return [self._archive_subreddit_summary_from_row(db, row) for row in rows]
+
+    def get_archive_subreddit_summary(self, subreddit: str) -> dict[str, Any] | None:
+        normalized = _normalize_subreddit(subreddit)
+        if not normalized:
+            return None
+        with self.connect() as db:
+            row = db.execute(
+                """
+                SELECT
+                    LOWER(subreddit) AS subreddit_key,
+                    COUNT(*) AS items,
+                    SUM(CASE WHEN kind='post' THEN 1 ELSE 0 END) AS posts,
+                    SUM(CASE WHEN kind='comment' THEN 1 ELSE 0 END) AS comments,
+                    MIN(created_utc) AS min_created_utc,
+                    MAX(created_utc) AS max_created_utc
+                FROM reddit_items
+                WHERE LOWER(subreddit) = LOWER(?)
+                GROUP BY LOWER(subreddit)
+                """,
+                (normalized,),
+            ).fetchone()
+            return self._archive_subreddit_summary_from_row(db, row) if row else None
+
+    def list_reddit_posts_for_subreddit(self, subreddit: str) -> list[dict[str, Any]]:
+        normalized = _normalize_subreddit(subreddit)
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT *
+                FROM reddit_items
+                WHERE kind='post' AND LOWER(subreddit) = LOWER(?)
+                ORDER BY created_utc IS NULL, created_utc ASC, id ASC
+                """,
+                (normalized,),
+            ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def list_reddit_comments_for_subreddit(self, subreddit: str) -> list[dict[str, Any]]:
+        normalized = _normalize_subreddit(subreddit)
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT *
+                FROM reddit_items
+                WHERE kind='comment' AND LOWER(subreddit) = LOWER(?)
+                ORDER BY created_utc IS NULL, created_utc ASC, id ASC
+                """,
+                (normalized,),
+            ).fetchall()
+        return [_row_to_dict(row) for row in rows]
 
     def get_ingestion_job(self, job_id: int) -> dict[str, Any] | None:
         with self.connect() as db:
@@ -440,6 +865,108 @@ class Database:
 
     def _run_migrations(self, db: sqlite3.Connection) -> None:
         _ensure_column(db, "conversations", "system_prompt", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(db, "archive_semantic_chunks", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
+        _ensure_column(db, "archive_semantic_chunks", "embedding_dimensions", "INTEGER")
+
+    def _archive_subreddit_summary_from_row(self, db: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+        subreddit_key = str(row["subreddit_key"] or "")
+        files = db.execute(
+            """
+            SELECT DISTINCT af.path
+            FROM reddit_items ri
+            JOIN archive_files af ON af.id = ri.archive_file_id
+            WHERE LOWER(ri.subreddit) = ?
+            ORDER BY af.path
+            """,
+            (subreddit_key,),
+        ).fetchall()
+        latest = db.execute(
+            """
+            SELECT af.status, COALESCE(af.finished_at, af.updated_at, af.created_at) AS import_at
+            FROM reddit_items ri
+            JOIN archive_files af ON af.id = ri.archive_file_id
+            WHERE LOWER(ri.subreddit) = ?
+            ORDER BY import_at DESC, af.id DESC
+            LIMIT 1
+            """,
+            (subreddit_key,),
+        ).fetchone()
+        rag = db.execute(
+            """
+            SELECT
+                COUNT(sc.id) AS semantic_chunks,
+                COUNT(
+                    DISTINCT CASE
+                        WHEN ase.id IS NOT NULL
+                            OR (sc.embedding_model_id IS NOT NULL AND sc.embedding_model_id != '')
+                        THEN sc.item_id
+                    END
+                ) AS embedded_items
+            FROM reddit_items ri
+            LEFT JOIN archive_semantic_chunks sc ON sc.item_id = ri.id
+            LEFT JOIN archive_semantic_embeddings ase ON ase.semantic_chunk_id = sc.id
+            WHERE LOWER(ri.subreddit) = ?
+            """,
+            (subreddit_key,),
+        ).fetchone()
+        model_rows = db.execute(
+            """
+            SELECT DISTINCT sc.embedding_model_id
+            FROM reddit_items ri
+            JOIN archive_semantic_chunks sc ON sc.item_id = ri.id
+            WHERE LOWER(ri.subreddit) = ?
+                AND sc.embedding_model_id IS NOT NULL
+                AND sc.embedding_model_id != ''
+            ORDER BY sc.embedding_model_id
+            """,
+            (subreddit_key,),
+        ).fetchall()
+        dimension_rows = db.execute(
+            """
+            SELECT DISTINCT sc.embedding_dimensions
+            FROM reddit_items ri
+            JOIN archive_semantic_chunks sc ON sc.item_id = ri.id
+            WHERE LOWER(ri.subreddit) = ?
+                AND sc.embedding_dimensions IS NOT NULL
+                AND sc.embedding_model_id IS NOT NULL
+                AND sc.embedding_model_id != ''
+            ORDER BY sc.embedding_dimensions
+            """,
+            (subreddit_key,),
+        ).fetchall()
+        metadata_rows = db.execute(
+            """
+            SELECT meta_json
+            FROM reddit_items
+            WHERE LOWER(subreddit) = ?
+            """,
+            (subreddit_key,),
+        ).fetchall()
+        metadata_fields: set[str] = set()
+        for metadata_row in metadata_rows:
+            try:
+                metadata = json.loads(metadata_row["meta_json"])
+            except json.JSONDecodeError:
+                metadata = {}
+            if isinstance(metadata, dict):
+                metadata_fields.update(str(key) for key in metadata.keys())
+
+        return {
+            "subreddit": subreddit_key,
+            "items": int(row["items"] or 0),
+            "posts": int(row["posts"] or 0),
+            "comments": int(row["comments"] or 0),
+            "min_created_utc": row["min_created_utc"],
+            "max_created_utc": row["max_created_utc"],
+            "source_files": [file_row["path"] for file_row in files],
+            "latest_import_at": latest["import_at"] if latest else None,
+            "latest_import_status": latest["status"] if latest else None,
+            "semantic_chunks": int(rag["semantic_chunks"] or 0),
+            "embedded_items": int(rag["embedded_items"] or 0),
+            "embedding_model_ids": [model_row["embedding_model_id"] for model_row in model_rows],
+            "embedding_dimensions": [int(dimension_row["embedding_dimensions"]) for dimension_row in dimension_rows],
+            "metadata_fields": sorted(metadata_fields),
+        }
 
 
 def _json(value: Any) -> str:
@@ -493,6 +1020,13 @@ def _ensure_column(db: sqlite3.Connection, table: str, column: str, declaration:
         db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
 
+def _normalize_subreddit(value: str | None) -> str:
+    text = (value or "").strip()
+    if text.lower().startswith("r/"):
+        text = text[2:]
+    return text
+
+
 def _reddit_filters(
     kind: str | None = None,
     subreddit: str | None = None,
@@ -508,7 +1042,7 @@ def _reddit_filters(
         values.append(kind)
     if subreddit:
         clauses.append(f"LOWER({table_prefix}subreddit) = LOWER(?)")
-        values.append(subreddit.removeprefix("r/"))
+        values.append(_normalize_subreddit(subreddit))
     if after is not None:
         clauses.append(f"{table_prefix}created_utc >= ?")
         values.append(after)
@@ -606,6 +1140,23 @@ CREATE TABLE IF NOT EXISTS ingestion_jobs (
     failed_count INTEGER NOT NULL DEFAULT 0,
     log TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    finished_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS reddit_import_jobs (
+    id INTEGER PRIMARY KEY,
+    target_type TEXT NOT NULL,
+    target_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    current_stage TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    stage_counts_json TEXT NOT NULL DEFAULT '{}',
+    progress_percent REAL NOT NULL DEFAULT 0,
+    eta_seconds INTEGER,
+    eta_label TEXT NOT NULL DEFAULT 'estimating',
+    log TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     finished_at TEXT
 );
 
@@ -729,8 +1280,20 @@ CREATE TABLE IF NOT EXISTS archive_semantic_chunks (
     chunk_index INTEGER NOT NULL,
     citation_id TEXT NOT NULL,
     text TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
     embedding_model_id TEXT,
+    embedding_dimensions INTEGER,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(item_id, chunk_index)
+);
+
+CREATE TABLE IF NOT EXISTS archive_semantic_embeddings (
+    id INTEGER PRIMARY KEY,
+    semantic_chunk_id INTEGER NOT NULL REFERENCES archive_semantic_chunks(id) ON DELETE CASCADE,
+    model_id TEXT NOT NULL,
+    dimensions INTEGER NOT NULL,
+    vector_blob BLOB NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(semantic_chunk_id, model_id)
 );
 """
