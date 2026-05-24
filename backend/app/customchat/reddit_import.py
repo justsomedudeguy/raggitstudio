@@ -151,6 +151,7 @@ class RedditImportService:
             "downloaded_bytes": 0,
             "imported_rows": 0,
             "metadata_rows": 0,
+            "classifier_items": 0,
             "semantic_chunks": 0,
             "embedded_chunks": 0,
         }
@@ -171,55 +172,83 @@ class RedditImportService:
 
         downloaded_paths: list[Path] = []
         try:
-            update("downloading", progress=5)
-            for kind in _selected_kinds(payload):
-                path = self._download_path(payload, kind)
-                base_downloaded = int(counts["downloaded_items"])
-                base_bytes = int(counts["downloaded_bytes"])
+            update("checking_auxiliary_models", progress=2)
+            await self._check_auxiliary_models()
+            subreddits = self.database.archive_subreddits_for_import_target(payload["target_type"], payload["target_name"])
+            selected_kinds = _selected_kinds(payload)
+            existing_kind_counts = self.database.reddit_item_kind_counts_for_import_target(
+                payload["target_type"], payload["target_name"]
+            )
+            existing_rows = sum(existing_kind_counts.get(kind, 0) for kind in selected_kinds)
+            missing_kinds = [kind for kind in selected_kinds if existing_kind_counts.get(kind, 0) == 0]
+            if existing_rows:
+                counts["downloaded_items"] = existing_rows
+                counts["imported_rows"] = existing_rows
+                update("resuming", progress=45, eta_total=max(1, existing_rows), log=f"Resuming from {existing_rows} imported rows.")
+            if missing_kinds:
+                update("downloading", progress=5)
+                for kind in missing_kinds:
+                    path = self._download_path(payload, kind)
+                    base_downloaded = int(counts["downloaded_items"])
+                    base_bytes = int(counts["downloaded_bytes"])
 
-                def progress(downloaded: int, _total: int | None, byte_count: int) -> None:
-                    counts["downloaded_items"] = base_downloaded + max(0, downloaded)
-                    counts["downloaded_bytes"] = base_bytes + max(0, byte_count)
-                    update("downloading", progress=15)
+                    def progress(downloaded: int, _total: int | None, byte_count: int) -> None:
+                        counts["downloaded_items"] = base_downloaded + max(0, downloaded)
+                        counts["downloaded_bytes"] = base_bytes + max(0, byte_count)
+                        update("downloading", progress=15)
 
-                result = await self.downloader.download(
-                    target_type=payload["target_type"],
-                    target_name=payload["target_name"],
-                    kind=kind,
-                    start_date=payload["start_date"],
-                    end_date=payload["end_date"],
-                    output_path=path,
-                    progress=progress,
-                )
-                downloaded_paths.append(Path(result["path"]))
-                counts["downloaded_items"] = base_downloaded + int(result.get("count") or 0)
-                counts["downloaded_bytes"] = base_bytes + int(result.get("bytes") or 0)
+                    result = await self.downloader.download(
+                        target_type=payload["target_type"],
+                        target_name=payload["target_name"],
+                        kind=kind,
+                        start_date=payload["start_date"],
+                        end_date=payload["end_date"],
+                        output_path=path,
+                        progress=progress,
+                    )
+                    downloaded_paths.append(Path(result["path"]))
+                    counts["downloaded_items"] = base_downloaded + int(result.get("count") or 0)
+                    counts["downloaded_bytes"] = base_bytes + int(result.get("bytes") or 0)
 
-            update("importing", progress=30, eta_total=max(1, int(counts["downloaded_items"])))
-            imported_file_paths: list[str] = []
-            for path in downloaded_paths:
-                kind = "comment" if "comment" in path.name else "post"
-                result = self.archive.import_file(path, kind=kind)
-                counts["imported_rows"] = int(counts["imported_rows"]) + result.indexed_count
-                imported_file_paths.append(result.path)
-                update("importing", progress=45, eta_total=max(1, int(counts["downloaded_items"])))
+                update("importing", progress=30, eta_total=max(1, int(counts["downloaded_items"])))
+                imported_file_paths: list[str] = []
+                for path in downloaded_paths:
+                    kind = "comment" if "comment" in path.name else "post"
+                    result = self.archive.import_file(path, kind=kind)
+                    counts["imported_rows"] = int(counts["imported_rows"]) + result.indexed_count
+                    imported_file_paths.append(result.path)
+                    update("importing", progress=45, eta_total=max(1, int(counts["downloaded_items"])))
 
-            subreddits = self.database.archive_subreddits_for_paths(imported_file_paths)
+                subreddits = self.database.archive_subreddits_for_paths(imported_file_paths)
+                if existing_rows:
+                    subreddits = sorted(
+                        set(subreddits)
+                        | set(self.database.archive_subreddits_for_import_target(payload["target_type"], payload["target_name"]))
+                    )
             update("metadata", progress=55, eta_total=max(1, int(counts["imported_rows"])))
             for subreddit in subreddits:
                 counts["metadata_rows"] = int(counts["metadata_rows"]) + await self._enrich_subreddit_metadata(subreddit)
-                update("metadata", progress=65, eta_total=max(1, int(counts["imported_rows"])))
+                update("metadata", progress=60, eta_total=max(1, int(counts["imported_rows"])))
+
+            update("classifier", progress=65, eta_total=max(1, int(counts["imported_rows"])))
+            for subreddit in subreddits:
+                counts["classifier_items"] = int(counts.get("classifier_items", 0)) + await self._classify_subreddit(subreddit)
+                update("classifier", progress=71, eta_total=max(1, int(counts["imported_rows"])))
 
             update("chunking", progress=72, eta_total=max(1, int(counts["metadata_rows"])))
             chunk_ids: list[int] = []
             for subreddit in subreddits:
-                next_chunks = self._build_subreddit_chunks(subreddit)
-                chunk_ids.extend(next_chunks)
-                counts["semantic_chunks"] = int(counts["semantic_chunks"]) + len(next_chunks)
+                self._build_subreddit_chunks(subreddit)
+                semantic_counts = self.database.archive_semantic_counts_for_subreddit(subreddit, self.settings.embedding_model_id)
+                counts["semantic_chunks"] = int(counts["semantic_chunks"]) + semantic_counts["semantic_chunks"]
+                counts["embedded_chunks"] = int(counts["embedded_chunks"]) + semantic_counts["embedded_chunks"]
+                chunk_ids.extend(
+                    self.database.list_unembedded_archive_semantic_chunk_ids(subreddit, self.settings.embedding_model_id)
+                )
                 update("chunking", progress=82, eta_total=max(1, int(counts["metadata_rows"])))
 
             update("embedding", progress=88, eta_total=max(1, len(chunk_ids)))
-            counts["embedded_chunks"] = await self._embed_chunks(chunk_ids, counts, update)
+            await self._embed_chunks(chunk_ids, counts, update)
             update("complete", status="completed", progress=100, eta_total=max(1, int(counts["embedded_chunks"])))
         except Exception as exc:  # noqa: BLE001 - job status should retain the failure
             update("error", status="failed", progress=0, log=str(exc))
@@ -236,26 +265,53 @@ class RedditImportService:
         processed = 0
         for item in items:
             meta = dict(item.get("meta") or {})
+            if _metadata_complete(meta):
+                processed += 1
+                continue
             raw = dict(item.get("raw") or {})
             deterministic = _deterministic_metadata(item, raw, by_author.get(str(item.get("author") or ""), {}))
             meta.update(deterministic)
-            try:
-                title = str(item.get("title") or f"Reddit {item.get('kind') or 'item'}")
-                classified = await self.lemonade.classify(
-                    self.settings.classifier_model_id,
-                    title,
-                    str(item.get("text") or ""),
-                    "reddit_archive",
-                )
-                meta["classifier"] = classified.model_dump()
-            except Exception:
-                meta.setdefault("classifier", {"status": "unavailable"})
+            meta.setdefault("classifier", {"status": "unavailable"})
             self.database.update_reddit_item_meta(int(item["id"]), meta)
             processed += 1
         return processed
 
+    async def _classify_subreddit(self, subreddit: str) -> int:
+        items = self.database.list_reddit_items_for_subreddit(subreddit)
+        classified = 0
+        for item in items:
+            meta = dict(item.get("meta") or {})
+            classifier = meta.get("classifier")
+            if isinstance(classifier, dict) and classifier.get("status") != "unavailable":
+                classified += 1
+                continue
+            title = str(item.get("title") or f"Reddit {item.get('kind') or 'item'}")
+            text = str(item.get("text") or "")
+            try:
+                classified_result = await self.lemonade.classify(
+                    self.settings.classifier_model_id,
+                    title,
+                    text,
+                    "reddit_archive",
+                )
+                meta["classifier"] = classified_result.model_dump()
+            except Exception:
+                meta["classifier"] = {"status": "unavailable"}
+            self.database.update_reddit_item_meta(int(item["id"]), meta)
+            classified += 1
+        return classified
+
+    async def _check_auxiliary_models(self) -> None:
+        try:
+            vectors = await self.lemonade.embed(self.settings.embedding_model_id, ["Auxiliary embedding readiness probe."])
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"Auxiliary embedding model '{self.settings.embedding_model_id}' is not ready: {exc}"
+            ) from exc
+        if not vectors:
+            raise RuntimeError(f"Auxiliary embedding model '{self.settings.embedding_model_id}' returned no vectors.")
+
     def _build_subreddit_chunks(self, subreddit: str) -> list[int]:
-        self.database.delete_archive_semantic_for_subreddit(subreddit)
         items = self.database.list_reddit_items_for_subreddit(subreddit)
         posts_by_key, comments_by_key = _thread_indexes(items)
         chunk_ids: list[int] = []
@@ -281,6 +337,7 @@ class RedditImportService:
 
     async def _embed_chunks(self, chunk_ids: list[int], counts: dict[str, Any], update: Callable[..., None]) -> int:
         embedded = 0
+        base_embedded = int(counts.get("embedded_chunks") or 0)
         batch_size = 32
         for start in range(0, len(chunk_ids), batch_size):
             batch_ids = chunk_ids[start : start + batch_size]
@@ -289,7 +346,7 @@ class RedditImportService:
             for chunk, vector in zip(chunks, vectors, strict=False):
                 self.database.insert_archive_embedding(int(chunk["id"]), self.settings.embedding_model_id, vector)
                 embedded += 1
-            counts["embedded_chunks"] = embedded
+            counts["embedded_chunks"] = base_embedded + embedded
             update("embedding", progress=90 + int(8 * (embedded / max(1, len(chunk_ids)))), eta_total=max(1, len(chunk_ids)))
         return embedded
 
@@ -301,6 +358,16 @@ def _selected_kinds(payload: dict[str, Any]) -> list[str]:
     if payload.get("include_comments"):
         kinds.append("comment")
     return kinds
+
+
+def _metadata_complete(meta: dict[str, Any]) -> bool:
+    classifier = meta.get("classifier")
+    return (
+        "upvotes" in meta
+        and "poster_archive_item_count" in meta
+        and isinstance(classifier, dict)
+        and bool(classifier)
+    )
 
 
 def _clean_target_name(value: str) -> str:

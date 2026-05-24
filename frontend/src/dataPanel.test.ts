@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  archivePipelineMessage,
   buildRedditArchiveImportPlan,
   compactListPreview,
   formatClearStartedMessage,
@@ -46,6 +47,33 @@ describe("data panel helpers", () => {
     expect(formatClearStartedMessage("theehive", 107476)).toBe(
       "Clearing r/theehive 107,476 indexed items. This can take a minute for large archives.",
     );
+  });
+
+  it("describes imported archives with no semantic index as not built", () => {
+    expect(
+      archivePipelineMessage({
+        items: 23216,
+        metadata_items: 23132,
+        classifier_items: 5592,
+        semantic_chunks: 0,
+        embedded_items: 0,
+        semantic_index_state: "not_built",
+      }),
+    ).toBe("23,216 rows imported. Metadata 23,132 / 23,216. Classifier 5,592 / 23,216. Semantic index not built.");
+  });
+
+  it("describes interrupted archive imports as resumable", () => {
+    expect(
+      archivePipelineMessage({
+        items: 23216,
+        metadata_items: 23132,
+        classifier_items: 5592,
+        semantic_chunks: 0,
+        embedded_items: 0,
+        semantic_index_state: "not_built",
+        resumable_import: true,
+      }),
+    ).toBe("23,216 rows imported. Metadata 23,132 / 23,216. Classifier 5,592 / 23,216. Import interrupted; resume available.");
   });
 
   it("builds local Arctic Shift dump imports from the selected subreddit", () => {

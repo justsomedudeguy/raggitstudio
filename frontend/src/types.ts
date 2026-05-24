@@ -77,8 +77,14 @@ export interface ArchiveCoverage {
   items: number;
   posts: number;
   comments: number;
+  metadata_items?: number;
+  classifier_items?: number;
+  classifier_unavailable_items?: number;
   semantic_chunks: number;
+  semantic_embeddings?: number;
   embedded_items: number;
+  stale_running_jobs?: number;
+  resumable_import_jobs?: number;
 }
 
 export interface ArchiveSubredditSummary extends JsonRecord {
@@ -91,7 +97,13 @@ export interface ArchiveSubredditSummary extends JsonRecord {
   source_files?: string[] | number | string | null;
   latest_import_at?: string | null;
   latest_import_status?: string | null;
+  active_import_status?: string | null;
+  resumable_import?: boolean | null;
   status?: string | null;
+  semantic_index_state?: string | null;
+  metadata_items?: number | null;
+  classifier_items?: number | null;
+  classifier_unavailable_items?: number | null;
   semantic_chunks: number;
   embedded_items: number;
   embedding_model_ids?: string[] | string | null;

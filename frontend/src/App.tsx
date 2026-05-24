@@ -57,6 +57,7 @@ import {
   updateProviderSettings,
 } from "./api";
 import {
+  archivePipelineMessage,
   compactListPreview,
   formatClearStartedMessage,
   formatPurgeSummary,
@@ -1173,7 +1174,7 @@ function StatusView(props: StatusPanelProps) {
           <KeyValue label="Classifier" value={<AuxiliaryModelBadge id={status?.classifier?.id} available={status?.classifier?.available} />} />
         </section>
         <section className="panel">
-          <PanelTitle icon={Database} title="Database counts" />
+          <PanelTitle icon={Database} title="Uploaded corpus" />
           <MetricGrid database={status?.database} />
         </section>
         <section className="panel">
@@ -1228,6 +1229,9 @@ function AvailableDataPanel({
   const [exploring, setExploring] = useState<Record<string, boolean>>({});
   const [exploreErrors, setExploreErrors] = useState<Record<string, string>>({});
   const [exploreNotes, setExploreNotes] = useState<Record<string, string>>({});
+  const [resuming, setResuming] = useState<Record<string, boolean>>({});
+  const [resumeErrors, setResumeErrors] = useState<Record<string, string>>({});
+  const [resumeNotes, setResumeNotes] = useState<Record<string, string>>({});
 
   async function refreshAvailableData() {
     setLoading(true);
@@ -1330,6 +1334,35 @@ function AvailableDataPanel({
     }
   }
 
+  async function resumeSubredditImport(summary: ArchiveSubredditSummary) {
+    const subreddit = summary.subreddit;
+    setResuming((current) => ({ ...current, [subreddit]: true }));
+    setResumeErrors((current) => ({ ...current, [subreddit]: "" }));
+    setResumeNotes((current) => ({
+      ...current,
+      [subreddit]: "Resuming import. Existing rows are kept; missing metadata, chunks, and embeddings will be filled.",
+    }));
+    try {
+      const job = await startRedditImport({
+        target_type: "subreddit",
+        target_name: subreddit,
+        start_date: "2005-01-01",
+        end_date: "now",
+        include_posts: summary.posts > 0,
+        include_comments: summary.comments > 0,
+      });
+      setResumeNotes((current) => ({
+        ...current,
+        [subreddit]: `Resume job ${job.id} started at ${job.current_stage}. Refresh to track archive pipeline counts.`,
+      }));
+      await refreshAvailableData();
+    } catch (resumeError) {
+      setResumeErrors((current) => ({ ...current, [subreddit]: errorMessage(resumeError) }));
+    } finally {
+      setResuming((current) => ({ ...current, [subreddit]: false }));
+    }
+  }
+
   useEffect(() => {
     void refreshAvailableData();
   }, [refreshKey]);
@@ -1403,7 +1436,11 @@ function AvailableDataPanel({
                   clearing={Boolean(clearing[summary.subreddit])}
                   clearError={clearErrors[summary.subreddit] || ""}
                   clearNote={clearNotes[summary.subreddit] || ""}
+                  resuming={Boolean(resuming[summary.subreddit])}
+                  resumeError={resumeErrors[summary.subreddit] || ""}
+                  resumeNote={resumeNotes[summary.subreddit] || ""}
                   onExplore={() => void exploreSubreddit(summary)}
+                  onResume={() => void resumeSubredditImport(summary)}
                   onClear={() => void clearSubreddit(summary)}
                 />
               ))
@@ -1423,7 +1460,11 @@ function SubredditDataCard({
   clearing,
   clearError,
   clearNote,
+  resuming,
+  resumeError,
+  resumeNote,
   onExplore,
+  onResume,
   onClear,
 }: {
   summary: ArchiveSubredditSummary;
@@ -1433,7 +1474,11 @@ function SubredditDataCard({
   clearing: boolean;
   clearError: string;
   clearNote: string;
+  resuming: boolean;
+  resumeError: string;
+  resumeNote: string;
   onExplore: () => void;
+  onResume: () => void;
   onClear: () => void;
 }) {
   const status = archiveImportStatus(summary);
@@ -1456,10 +1501,9 @@ function SubredditDataCard({
       <div className="subreddit-details">
         <KeyValue label="Source files" value={formatSourceFiles(summary.source_files)} />
         <KeyValue label="Latest import" value={formatTime(summary.latest_import_at ?? undefined)} />
-        <KeyValue
-          label="Chunks"
-          value={`${formatCount(summary.semantic_chunks)} semantic / ${formatCount(summary.embedded_items)} embedded`}
-        />
+        <KeyValue label="Archive pipeline" value={archivePipelineMessage(summary)} />
+        <KeyValue label="Semantic chunks" value={formatCount(summary.semantic_chunks)} />
+        <KeyValue label="Embedded items" value={formatCount(summary.embedded_items)} />
         <KeyValue label="Models" value={compactListPreview(summary.embedding_model_ids, 2, "none")} />
         <KeyValue label="Dimensions" value={compactListPreview(summary.embedding_dimensions, 3, "unknown")} />
         <KeyValue label="Metadata" value={compactListPreview(summary.metadata_fields, 3, "none")} />
@@ -1469,6 +1513,18 @@ function SubredditDataCard({
           {exploring ? <Loader2 size={16} className="spin" /> : <FolderOpen size={16} />}
           Explore Data
         </button>
+       {summary.active_import_status === "queued" && (
+          <div className="inline-note">Import queued for r/{summary.subreddit}</div>
+        )}
+        {summary.active_import_status === "running" && (
+          <div className="inline-note">Import running for r/{summary.subreddit}</div>
+        )}
+        {summary.active_import_status === "interrupted" && (
+          <button type="button" className="button" onClick={onResume} disabled={resuming || clearing || exploring}>
+            {resuming ? <Loader2 size={16} className="spin" /> : <RefreshCw size={16} />}
+            {resuming ? "Resuming..." : "Resume"}
+          </button>
+        )}
         <button type="button" className="button danger" onClick={onClear} disabled={clearing || exploring}>
           {clearing ? <Loader2 size={16} className="spin" /> : <Trash2 size={16} />}
           {clearing ? "Clearing..." : "Clear"}
@@ -1476,6 +1532,8 @@ function SubredditDataCard({
       </div>
       {error && <InlineError message={error} />}
       {note && <div className="inline-note">{note}</div>}
+      {resumeError && <InlineError message={resumeError} />}
+      {resumeNote && <div className="inline-note">{resumeNote}</div>}
       {clearError && <InlineError message={clearError} />}
       {clearNote && <div className="inline-note">{clearNote}</div>}
     </article>
@@ -1849,8 +1907,8 @@ function MetricGrid({ database, compact }: { database?: StatusResponse["database
     <div className={compact ? "metric-grid compact" : "metric-grid"}>
       <Metric label="Sources" value={formatValue(database?.sources)} />
       <Metric label="Docs" value={formatValue(database?.documents)} />
-      <Metric label="Chunks" value={formatValue(database?.chunks)} />
-      <Metric label="Embeds" value={formatValue(database?.embeddings)} />
+      <Metric label="Corpus chunks" value={formatValue(database?.chunks)} />
+      <Metric label="Corpus embeddings" value={formatValue(database?.embeddings)} />
     </div>
   );
 }
@@ -1862,8 +1920,12 @@ function ArchiveMetricGrid({ coverage, compact }: { coverage?: ArchiveCoverage |
       <Metric label="Items" value={formatValue(coverage?.items)} />
       <Metric label="Posts" value={formatValue(coverage?.posts)} />
       <Metric label="Comments" value={formatValue(coverage?.comments)} />
+      <Metric label="Metadata rows" value={formatRatio(coverage?.metadata_items, coverage?.items)} />
+      <Metric label="Classifier rows" value={formatRatio(coverage?.classifier_items, coverage?.items)} />
       <Metric label="Semantic chunks" value={formatValue(coverage?.semantic_chunks)} />
-      <Metric label="Embedded rows" value={formatValue(coverage?.embedded_items)} />
+      <Metric label="Semantic embeddings" value={formatValue(coverage?.semantic_embeddings)} />
+      <Metric label="Embedded items" value={formatValue(coverage?.embedded_items)} />
+      <Metric label="Interrupted jobs" value={formatValue(coverage?.stale_running_jobs)} />
     </div>
   );
 }
@@ -1988,6 +2050,9 @@ function applyChatFrame(
       if (frame.event === "done") {
         return { ...message, status: "done" };
       }
+      if (frame.event === "error") {
+        return { ...message, status: "error", error: textFromFrame(frame) || "Chat stream failed." };
+      }
       return {
         ...message,
         events: [...message.events, { id: makeId("evt"), event: frame.event, data: frame.data }],
@@ -2049,6 +2114,10 @@ function formatValue(value: unknown): string {
   return String(value);
 }
 
+function formatRatio(value: number | null | undefined, total: number | null | undefined): string {
+  return `${formatCount(value)} / ${formatCount(total)}`;
+}
+
 function formatSourceFiles(value: ArchiveSubredditSummary["source_files"]): string {
   if (typeof value === "number" && Number.isFinite(value)) {
     return `${formatCount(value)} ${value === 1 ? "file" : "files"}`;
@@ -2057,7 +2126,7 @@ function formatSourceFiles(value: ArchiveSubredditSummary["source_files"]): stri
 }
 
 function archiveImportStatus(summary: ArchiveSubredditSummary): string {
-  return summary.latest_import_status || summary.status || "unknown";
+  return summary.active_import_status || summary.latest_import_status || summary.status || "unknown";
 }
 
 function isReadyArchiveStatus(status: string): boolean {

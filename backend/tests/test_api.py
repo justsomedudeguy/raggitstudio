@@ -1,4 +1,4 @@
-import numpy as np
+﻿import numpy as np
 import asyncio
 import json
 from fastapi.testclient import TestClient
@@ -86,6 +86,18 @@ class FakeLemonade:
         yield {"choices": [{"delta": {"reasoning_content": "thinking"}}]}
         yield {"choices": [{"delta": {"content": "answer"}}]}
         yield {"type": "done"}
+
+
+class FailingClassifierLemonade(FakeLemonade):
+    async def classify(self, model_id: str, title: str, text: str, source_type: str):
+        raise RuntimeError(f"Model '{model_id}' is not loaded")
+
+
+class FailingChatLemonade(FakeLemonade):
+    async def chat_stream(self, payload):
+        self.chat_payloads.append(payload)
+        raise RuntimeError("Network error: CURL error: Could not connect to server")
+        yield  # pragma: no cover
 
 
 class FakeLemonadeFactory:
@@ -338,6 +350,9 @@ def test_archive_subreddit_summaries_include_metadata_and_rag_counts(tmp_path):
     assert response.status_code == 200
     data = response.json()
     assert data["coverage"]["items"] == 2
+    assert data["coverage"]["metadata_items"] == 2
+    assert data["coverage"]["classifier_items"] == 0
+    assert data["coverage"]["semantic_embeddings"] == 0
     [summary] = data["subreddits"]
     assert summary["subreddit"] == "theehive"
     assert summary["items"] == 2
@@ -349,9 +364,51 @@ def test_archive_subreddit_summaries_include_metadata_and_rag_counts(tmp_path):
     assert summary["latest_import_status"] == "completed"
     assert summary["semantic_chunks"] == 2
     assert summary["embedded_items"] == 1
+    assert summary["metadata_items"] == 2
+    assert summary["classifier_items"] == 0
+    assert summary["semantic_index_state"] == "partial"
     assert summary["embedding_model_ids"] == ["embedder"]
     assert summary["embedding_dimensions"] == [2]
     assert summary["metadata_fields"] == ["source", "topic"]
+
+
+def test_archive_subreddit_summary_reports_interrupted_import_as_resumable(tmp_path):
+    app = _app(tmp_path)
+    client = TestClient(app)
+    archive = tmp_path / "r_theehive_posts.jsonl"
+    archive.write_text(
+        '{"id":"p1","name":"t3_p1","subreddit":"theehive","author":"a","created_utc":1710000000,'
+        '"score":1,"title":"resume me","selftext":"body"}\n',
+        encoding="utf-8",
+    )
+    imported = client.post("/api/archives/import", json={"path": str(archive), "kind": "post"})
+    assert imported.status_code == 200
+    database = app.state.database
+    with database.connect() as db:
+        db.execute(
+            """
+            INSERT INTO reddit_import_jobs(
+                target_type, target_name, status, current_stage, payload_json, stage_counts_json,
+                progress_percent, eta_label, updated_at
+            )
+            VALUES (
+                'subreddit', 'theehive', 'interrupted', 'metadata', '{}',
+                '{"downloaded_items":1,"imported_rows":1,"metadata_rows":0,"semantic_chunks":0,"embedded_chunks":0}',
+                55, 'estimating', datetime('now', '-10 minutes')
+            )
+            """
+        )
+
+    response = client.get("/api/archives/subreddits")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["coverage"]["stale_running_jobs"] == 0
+    assert data["coverage"]["resumable_import_jobs"] == 1
+    [summary] = data["subreddits"]
+    assert summary["active_import_status"] == "interrupted"
+    assert summary["resumable_import"] is True
+    assert summary["semantic_index_state"] == "not_built"
 
 
 def test_archive_subreddit_html_export_writes_served_escaped_pages(tmp_path):
@@ -543,7 +600,231 @@ def test_reddit_import_job_downloads_imports_metadata_chunks_embeddings_and_eta(
     data = search.json()
     assert data["results"][0]["citation_id"].startswith("R")
     assert "alpha" in data["packed_context"]
+    assert fake_lemonade.embed_model_ids == ["embedder", "embedder", "embedder"]
+
+
+def test_reddit_import_job_indexes_semantics_when_classifier_aux_model_is_not_ready(tmp_path):
+    fake_downloader = FakeRedditDownloader()
+    app = _app(
+        tmp_path,
+        lemonade=FailingClassifierLemonade(),
+        reddit_downloader=fake_downloader,
+        run_reddit_imports_inline=True,
+    )
+    client = TestClient(app)
+
+    started = client.post(
+        "/api/reddit-imports",
+        json={
+            "target_type": "subreddit",
+            "target_name": "TheeHive",
+            "start_date": "2024-01-01",
+            "end_date": "now",
+            "include_posts": True,
+            "include_comments": True,
+        },
+    )
+
+    assert started.status_code == 200
+    job = client.get(f"/api/reddit-imports/{started.json()['id']}").json()
+    assert job["status"] == "completed"
+    assert job["current_stage"] == "complete"
+    assert job["stage_counts"]["semantic_chunks"] >= 2
+    assert job["stage_counts"]["embedded_chunks"] == job["stage_counts"]["semantic_chunks"]
+    [summary] = client.get("/api/archives/subreddits").json()["subreddits"]
+    assert summary["semantic_index_state"] == "ready"
+    assert summary["classifier_unavailable_items"] == 2
+
+
+def test_reddit_import_start_reuses_active_job_for_same_target(tmp_path):
+    fake_downloader = FakeRedditDownloader()
+    fake_lemonade = FakeLemonade()
+    app = _app(
+        tmp_path,
+        lemonade=fake_lemonade,
+        reddit_downloader=fake_downloader,
+        run_reddit_imports_inline=True,
+    )
+    client = TestClient(app)
+    payload = {
+        "target_type": "subreddit",
+        "target_name": "TheeHive",
+        "start_date": "2024-01-01",
+        "end_date": "now",
+        "include_posts": True,
+        "include_comments": True,
+    }
+
+    first = client.post("/api/reddit-imports", json=payload)
+    assert first.status_code == 200
+    job_id = first.json()["id"]
+    # First job completed, status is now done
+    assert first.json()["status"] == "completed"
+    assert app.state.database.count_rows("reddit_import_jobs") == 1
+
+    # Create a fresh app where the first job is still in DB but completed
+    # Manually insert a new queued job to test reuse logic
+    db = app.state.database
+    job_id_2 = db.create_reddit_import_job({
+        "target_type": "subreddit",
+        "target_name": "TheeHive",
+        "start_date": "2024-01-01",
+        "end_date": "now",
+        "include_posts": True,
+        "include_comments": True,
+    })
+    db.update_reddit_import_job(job_id_2, status="running", current_stage="metadata")
+
+    # Second POST should find the active job and reuse it
+    second = client.post("/api/reddit-imports", json=payload)
+    assert second.status_code == 200
+    assert second.json()["id"] == job_id_2
+    assert second.json()["reused"] is True
+    # Only 2 job rows: the completed one and the reused one
+    assert app.state.database.count_rows("reddit_import_jobs") == 2
+
+
+def test_create_app_marks_unfinished_import_jobs_interrupted(tmp_path):
+    settings = _settings(tmp_path)
+    db = Database(settings.database_path)
+    db.initialize()
+    job_id = db.create_reddit_import_job(
+        {
+            "target_type": "subreddit",
+            "target_name": "TheeHive",
+            "start_date": "2024-01-01",
+            "end_date": "now",
+            "include_posts": True,
+            "include_comments": True,
+        }
+    )
+    db.update_reddit_import_job(job_id, status="running", current_stage="metadata")
+
+    app = create_app(settings=settings, database=db, lemonade=FakeLemonade(), run_reddit_imports_inline=False)
+    client = TestClient(app)
+
+    job = client.get(f"/api/reddit-imports/{job_id}").json()
+    assert job["status"] == "interrupted"
+    assert "interrupted" in job["log"].lower()
+    assert client.get("/api/status").json()["archive"]["resumable_import_jobs"] == 1
+
+
+def test_reddit_import_job_resumes_from_existing_archive_rows_after_interruption(tmp_path):
+    fake_downloader = FakeRedditDownloader()
+    fake_lemonade = FakeLemonade()
+    app = _app(
+        tmp_path,
+        lemonade=fake_lemonade,
+        reddit_downloader=fake_downloader,
+        run_reddit_imports_inline=True,
+    )
+    client = TestClient(app)
+    post_archive = tmp_path / "data" / "reddit" / "subreddit-theehive" / "interrupted" / "posts.jsonl"
+    comment_archive = tmp_path / "data" / "reddit" / "subreddit-theehive" / "interrupted" / "comments.jsonl"
+    post_archive.parent.mkdir(parents=True)
+    post_archive.write_text(
+        json.dumps(
+            {
+                "id": "p1",
+                "name": "t3_p1",
+                "subreddit": "theehive",
+                "author": "poster",
+                "created_utc": 1710000000,
+                "score": 12,
+                "title": "Alpha resume discussion",
+                "selftext": "alpha post evidence from an interrupted import",
+                "permalink": "/r/theehive/comments/p1/a/",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    comment_archive.write_text(
+        json.dumps(
+            {
+                "id": "c1",
+                "name": "t1_c1",
+                "subreddit": "theehive",
+                "author": "commenter",
+                "created_utc": 1710000010,
+                "score": 5,
+                "body": "alpha comment evidence from an interrupted import",
+                "link_id": "t3_p1",
+                "parent_id": "t3_p1",
+                "permalink": "/r/theehive/comments/p1/_/c1/",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    imported_posts = client.post("/api/archives/import", json={"path": str(post_archive), "kind": "post"})
+    imported_comments = client.post("/api/archives/import", json={"path": str(comment_archive), "kind": "comment"})
+    assert imported_posts.status_code == 200
+    assert imported_comments.status_code == 200
+
+    started = client.post(
+        "/api/reddit-imports",
+        json={
+            "target_type": "subreddit",
+            "target_name": "TheeHive",
+            "start_date": "2024-01-01",
+            "end_date": "now",
+            "include_posts": True,
+            "include_comments": True,
+        },
+    )
+
+    assert started.status_code == 200
+    job = client.get(f"/api/reddit-imports/{started.json()['id']}").json()
+    assert job["status"] == "completed"
+    assert job["stage_counts"]["downloaded_items"] == 2
+    assert job["stage_counts"]["imported_rows"] == 2
+    assert job["stage_counts"]["metadata_rows"] == 2
+    assert job["stage_counts"]["semantic_chunks"] >= 1
+    assert job["stage_counts"]["embedded_chunks"] == job["stage_counts"]["semantic_chunks"]
+    assert fake_downloader.calls == []
+
+    [summary] = client.get("/api/archives/subreddits").json()["subreddits"]
+    assert summary["semantic_chunks"] >= 1
+    assert summary["embedded_items"] == 2
+    assert "classifier" in summary["metadata_fields"]
+
+
+def test_reddit_import_job_resume_does_not_reembed_existing_semantic_chunks(tmp_path):
+    fake_downloader = FakeRedditDownloader()
+    fake_lemonade = FakeLemonade()
+    app = _app(
+        tmp_path,
+        lemonade=fake_lemonade,
+        reddit_downloader=fake_downloader,
+        run_reddit_imports_inline=True,
+    )
+    client = TestClient(app)
+    payload = {
+        "target_type": "subreddit",
+        "target_name": "TheeHive",
+        "start_date": "2024-01-01",
+        "end_date": "now",
+        "include_posts": True,
+        "include_comments": True,
+    }
+    first = client.post("/api/reddit-imports", json=payload)
+    assert first.status_code == 200
+    first_job = client.get(f"/api/reddit-imports/{first.json()['id']}").json()
+    assert first_job["status"] == "completed"
+    semantic_chunks = first_job["stage_counts"]["semantic_chunks"]
+    assert semantic_chunks >= 2
+    assert first_job["stage_counts"]["embedded_chunks"] == semantic_chunks
     assert fake_lemonade.embed_model_ids == ["embedder", "embedder"]
+
+    second = client.post("/api/reddit-imports", json=payload)
+    assert second.status_code == 200
+    second_job = client.get(f"/api/reddit-imports/{second.json()['id']}").json()
+    assert second_job["status"] == "completed"
+    assert second_job["stage_counts"]["semantic_chunks"] == semantic_chunks
+    assert second_job["stage_counts"]["embedded_chunks"] == semantic_chunks
+    assert len(fake_downloader.calls) == 2
+    assert fake_lemonade.embed_model_ids == ["embedder", "embedder", "embedder"]
 
 
 def test_clear_subreddit_removes_only_that_loaded_data_and_keeps_chat_history(tmp_path):
@@ -705,6 +986,28 @@ def test_chat_uses_loaded_subreddit_archive_instead_of_web_search(tmp_path):
     assert "MDMA synthesis datastore evidence" in body
     assert fake_web.queries == []
     assert "Use the following local Reddit archive datastore context" in fake.chat_payloads[0]["messages"][0]["content"]
+
+
+def test_chat_stream_emits_error_event_when_upstream_chat_fails(tmp_path):
+    app = _app(tmp_path, lemonade=FailingChatLemonade())
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/chat/stream",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            "mode": "direct",
+            "model_id": "chat-model",
+            "tools_enabled": False,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.text
+    assert "event: conversation" in body
+    assert "event: error" in body
+    assert "Network error: CURL error: Could not connect to server" in body
+    assert "event: done" not in body
 
 
 def _app(tmp_path, lemonade=None, web_search=None, reddit_downloader=None, run_reddit_imports_inline=False):

@@ -5,14 +5,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="CUSTOMCHAT_", env_file=".env")
+    model_config = SettingsConfigDict(env_prefix="CUSTOMCHAT_", env_file=Path(__file__).resolve().parents[3] / ".env")
 
     app_root: Path = Field(default_factory=lambda: Path(__file__).resolve().parents[3])
-    lemonade_base_url: str = "http://127.0.0.1:13305/v1"
-    chat_model_id: str = "Qwen3.5-4B-heretic-v2-i1-GGUF-Q4_K_M"
-    embedding_model_id: str = "zembed-1-Q4_K_M-GGUF-Q4_K_M"
-    reranker_model_id: str = "bge-reranker-v2-m3-Q8_0-GGUF"
-    classifier_model_id: str = "Qwen3.5-4B-heretic-v2-i1-GGUF-Q4_K_M"
+    lemonade_base_url: str = ""
+    chat_model_id: str = ""
+    embedding_model_id: str = ""
+    reranker_model_id: str = ""
+    classifier_model_id: str = ""
     chunk_tokens: int = 800
     overlap_tokens: int = 120
     crawl_max_pages: int = 25

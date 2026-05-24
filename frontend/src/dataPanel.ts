@@ -5,6 +5,17 @@ export interface RedditArchiveImportPlanItem {
   path: string;
 }
 
+export interface ArchivePipelineSummary {
+  items: number;
+  metadata_items?: number | null;
+  classifier_items?: number | null;
+  semantic_chunks: number;
+  embedded_items: number;
+  semantic_index_state?: string | null;
+  resumable_import?: boolean | null;
+  active_import_status?: string | null;
+}
+
 export function buildRedditArchiveImportPlan(
   targetType: RedditArchiveTargetType,
   targetName: string,
@@ -70,6 +81,26 @@ export function formatPurgeSummary(deleted: Record<string, number>): string {
 export function formatClearStartedMessage(subreddit: string, itemCount?: number | null): string {
   const count = typeof itemCount === "number" && Number.isFinite(itemCount) ? ` ${formatInteger(itemCount)} indexed items` : " indexed data";
   return `Clearing r/${subreddit}${count}. This can take a minute for large archives.`;
+}
+
+export function archivePipelineMessage(summary: ArchivePipelineSummary): string {
+  const rows = formatInteger(summary.items);
+  const metadata = `${formatInteger(summary.metadata_items ?? 0)} / ${rows}`;
+  const classifier = `${formatInteger(summary.classifier_items ?? 0)} / ${rows}`;
+  const importStatus = summary.active_import_status;
+  if (importStatus === "queued" || importStatus === "running") {
+    return `${rows} rows imported. Metadata ${metadata}. Classifier ${classifier}. Import ${importStatus}.`;
+  }
+  if (summary.resumable_import) {
+    return `${rows} rows imported. Metadata ${metadata}. Classifier ${classifier}. Import interrupted; resume available.`;
+  }
+  if ((summary.semantic_index_state ?? "") === "not_built" || summary.semantic_chunks === 0) {
+    return `${rows} rows imported. Metadata ${metadata}. Classifier ${classifier}. Semantic index not built.`;
+  }
+  if ((summary.semantic_index_state ?? "") === "partial" || summary.embedded_items < summary.items) {
+    return `${rows} rows imported. Metadata ${metadata}. Classifier ${classifier}. Semantic index partial.`;
+  }
+  return `${rows} rows imported. Metadata ${metadata}. Classifier ${classifier}. Semantic index ready.`;
 }
 
 export function openArchiveExportUrl(openUrl: string, opener: BrowserOpener | undefined = defaultOpener()): boolean {

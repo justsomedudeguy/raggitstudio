@@ -24,6 +24,14 @@ stay local and are intentionally ignored by git.
 - Routes exact count prompts, such as `How many times is "XXX" mentioned?`, to the raw
   archive index instead of asking the LLM to guess.
 - Adds archive-backed context to semantic chat queries so answers can cite raw Reddit rows.
+- Reddit import pipeline: download → metadata → classifier → semantic chunking → embedding.
+  Metadata and chunking run fast; classifier runs as a separate phase. Import resumes
+  gracefully from the last completed stage.
+- Duplicate import protection: starting an import for the same target returns the existing
+  active job instead of creating a duplicate.
+- Stale job reconciliation: unfinished queued/running jobs from crashes are marked
+  interrupted at app startup.
+- Manual interrupt endpoint: `PATCH /api/reddit-imports/{job_id}` to pause a running job.
 
 The Reddit archive importer is based on Arthur Heitmann's Arctic Shift tooling:
 https://github.com/ArthurHeitmann/arctic_shift.
@@ -93,6 +101,19 @@ npm run dev:frontend
 
 Imported archives and generated SQLite stores are local runtime data. They should not be
 committed.
+
+## Reddit Import Pipeline
+
+The import runs in stages:
+
+1. **Download** — fetches posts/comments from Arctic Shift API.
+2. **Metadata** — adds deterministic fields (upvotes, poster counts) and marks classifier as unavailable.
+3. **Classifier** — runs LLM classification on each item (separate phase, progress visible in UI).
+4. **Chunking** — builds semantic chunks from item text.
+5. **Embedding** — generates embeddings for all chunks.
+
+Import resumes from the last stage on restart. Duplicate imports for the same target
+return the existing job. Stale jobs from crashes are auto-marked interrupted.
 
 ## Test
 

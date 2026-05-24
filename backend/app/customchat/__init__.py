@@ -1,4 +1,4 @@
-"""Local Qwen3.5 RAG workbench backend package."""
+"""Local RAG workbench backend package."""
 
 __all__ = [
     "database",
@@ -7,4 +7,3 @@ __all__ = [
     "metadata",
     "rag",
 ]
-

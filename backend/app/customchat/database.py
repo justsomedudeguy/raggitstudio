@@ -336,6 +336,7 @@ class Database:
                 """
             ).fetchone()
             chunks = db.execute("SELECT COUNT(*) AS count FROM archive_semantic_chunks").fetchone()
+            embeddings = db.execute("SELECT COUNT(*) AS count FROM archive_semantic_embeddings").fetchone()
             embedded = db.execute(
                 """
                 SELECT COUNT(
@@ -349,13 +350,39 @@ class Database:
                 LEFT JOIN archive_semantic_embeddings ase ON ase.semantic_chunk_id = sc.id
                 """
             ).fetchone()
+            metadata = db.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN meta_json IS NOT NULL AND meta_json != '{}' THEN 1 ELSE 0 END) AS metadata_items,
+                    SUM(CASE WHEN json_extract(meta_json, '$.classifier') IS NOT NULL THEN 1 ELSE 0 END) AS classifier_items,
+                    SUM(CASE WHEN json_extract(meta_json, '$.classifier.status') = 'unavailable' THEN 1 ELSE 0 END)
+                        AS classifier_unavailable_items
+                FROM reddit_items
+             """
+            ).fetchone()
+            jobs = db.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN status='running' AND finished_at IS NULL THEN 1 ELSE 0 END) AS stale_running_jobs,
+                    SUM(CASE WHEN status='interrupted' AND finished_at IS NULL THEN 1 ELSE 0 END) AS resumable_import_jobs
+                FROM reddit_import_jobs
+                """
+            ).fetchone()
+            stale_running_jobs = int(jobs["stale_running_jobs"] or 0)
+            resumable_import_jobs = int(jobs["resumable_import_jobs"] or 0)
         return {
             "files": int(row["files"] or 0),
             "items": int(row["items"] or 0),
             "posts": int(row["posts"] or 0),
             "comments": int(row["comments"] or 0),
+            "metadata_items": int(metadata["metadata_items"] or 0),
+            "classifier_items": int(metadata["classifier_items"] or 0),
+            "classifier_unavailable_items": int(metadata["classifier_unavailable_items"] or 0),
             "semantic_chunks": int(chunks["count"] or 0),
+            "semantic_embeddings": int(embeddings["count"] or 0),
             "embedded_items": int(embedded["count"] or 0),
+            "stale_running_jobs": stale_running_jobs,
+            "resumable_import_jobs": resumable_import_jobs,
         }
 
     def create_reddit_import_job(self, payload: dict[str, Any]) -> int:
@@ -421,6 +448,51 @@ class Database:
             row = db.execute("SELECT * FROM reddit_import_jobs WHERE id = ?", (job_id,)).fetchone()
         return _row_to_dict(row) if row else None
 
+    def find_active_reddit_import_job(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        target_type = (payload.get("target_type") or "").strip().lower()
+        target_name = (payload.get("target_name") or "").strip()
+        if not target_name:
+            return None
+        with self.connect() as db:
+            row = db.execute(
+                """
+                SELECT * FROM reddit_import_jobs
+                WHERE LOWER(target_type) = ?
+                    AND LOWER(target_name) = LOWER(?)
+                    AND status IN ('queued', 'running', 'interrupted')
+                    AND finished_at IS NULL
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                """,
+                (target_type, target_name),
+            ).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def reconcile_interrupted_reddit_import_jobs(self) -> int:
+        count = 0
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT id, status, current_stage FROM reddit_import_jobs
+                WHERE status IN ('queued', 'running')
+                    AND finished_at IS NULL
+                """
+            ).fetchall()
+            for row in rows:
+                job_id = row["id"]
+                db.execute(
+                    """
+                    UPDATE reddit_import_jobs
+                    SET status = 'interrupted',
+                        log = COALESCE(log, '') || 'Interrupted at app startup: unfinished job.',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (job_id,),
+                )
+                count += 1
+        return count
+
     def archive_subreddits_for_paths(self, paths: list[str]) -> list[str]:
         if not paths:
             return []
@@ -438,6 +510,52 @@ class Database:
             ).fetchall()
         return [str(row["subreddit"]) for row in rows]
 
+    def archive_subreddits_for_import_target(self, target_type: str, target_name: str) -> list[str]:
+        target_type = (target_type or "").strip().lower()
+        target_name = (target_name or "").strip()
+        if not target_name:
+            return []
+        if target_type == "subreddit":
+            where = "LOWER(ri.subreddit) = LOWER(?)"
+        elif target_type == "user":
+            where = "LOWER(ri.author) = LOWER(?)"
+        else:
+            return []
+        with self.connect() as db:
+            rows = db.execute(
+                f"""
+                SELECT DISTINCT LOWER(ri.subreddit) AS subreddit
+                FROM reddit_items ri
+                WHERE {where} AND TRIM(ri.subreddit) != ''
+                ORDER BY LOWER(ri.subreddit)
+                """,
+                (target_name,),
+            ).fetchall()
+        return [str(row["subreddit"]) for row in rows]
+
+    def reddit_item_kind_counts_for_import_target(self, target_type: str, target_name: str) -> dict[str, int]:
+        target_type = (target_type or "").strip().lower()
+        target_name = (target_name or "").strip()
+        if not target_name:
+            return {}
+        if target_type == "subreddit":
+            where = "LOWER(subreddit) = LOWER(?)"
+        elif target_type == "user":
+            where = "LOWER(author) = LOWER(?)"
+        else:
+            return {}
+        with self.connect() as db:
+            rows = db.execute(
+                f"""
+                SELECT kind, COUNT(*) AS count
+                FROM reddit_items
+                WHERE {where}
+                GROUP BY kind
+                """,
+                (target_name,),
+            ).fetchall()
+        return {str(row["kind"]): int(row["count"] or 0) for row in rows}
+
     def list_reddit_items_for_subreddit(self, subreddit: str) -> list[dict[str, Any]]:
         normalized = _normalize_subreddit(subreddit)
         with self.connect() as db:
@@ -451,6 +569,44 @@ class Database:
                 (normalized,),
             ).fetchall()
         return [_row_to_dict(row) for row in rows]
+
+    def list_unembedded_archive_semantic_chunk_ids(self, subreddit: str, model_id: str) -> list[int]:
+        normalized = _normalize_subreddit(subreddit)
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT sc.id
+                FROM archive_semantic_chunks sc
+                JOIN reddit_items ri ON ri.id = sc.item_id
+                LEFT JOIN archive_semantic_embeddings ase
+                    ON ase.semantic_chunk_id = sc.id AND ase.model_id = ?
+                WHERE LOWER(ri.subreddit) = LOWER(?) AND ase.id IS NULL
+                ORDER BY sc.id
+                """,
+                (model_id, normalized),
+            ).fetchall()
+        return [int(row["id"]) for row in rows]
+
+    def archive_semantic_counts_for_subreddit(self, subreddit: str, model_id: str) -> dict[str, int]:
+        normalized = _normalize_subreddit(subreddit)
+        with self.connect() as db:
+            row = db.execute(
+                """
+                SELECT
+                    COUNT(sc.id) AS semantic_chunks,
+                    COUNT(DISTINCT CASE WHEN ase.id IS NOT NULL THEN sc.id END) AS embedded_chunks
+                FROM archive_semantic_chunks sc
+                JOIN reddit_items ri ON ri.id = sc.item_id
+                LEFT JOIN archive_semantic_embeddings ase
+                    ON ase.semantic_chunk_id = sc.id AND ase.model_id = ?
+                WHERE LOWER(ri.subreddit) = LOWER(?)
+                """,
+                (model_id, normalized),
+            ).fetchone()
+        return {
+            "semantic_chunks": int(row["semantic_chunks"] or 0),
+            "embedded_chunks": int(row["embedded_chunks"] or 0),
+        }
 
     def update_reddit_item_meta(self, item_id: int, meta: dict[str, Any]) -> None:
         with self.connect() as db:
@@ -943,6 +1099,9 @@ class Database:
             (subreddit_key,),
         ).fetchall()
         metadata_fields: set[str] = set()
+        metadata_items = 0
+        classifier_items = 0
+        classifier_unavailable_items = 0
         for metadata_row in metadata_rows:
             try:
                 metadata = json.loads(metadata_row["meta_json"])
@@ -950,10 +1109,44 @@ class Database:
                 metadata = {}
             if isinstance(metadata, dict):
                 metadata_fields.update(str(key) for key in metadata.keys())
+                if metadata:
+                    metadata_items += 1
+                classifier = metadata.get("classifier")
+                if classifier is not None:
+                    classifier_items += 1
+                    if isinstance(classifier, dict) and classifier.get("status") == "unavailable":
+                        classifier_unavailable_items += 1
+        active_job = db.execute(
+            """
+            SELECT *
+            FROM reddit_import_jobs
+            WHERE target_type = 'subreddit'
+                AND LOWER(target_name) = ?
+                AND status IN ('queued', 'running', 'interrupted')
+                AND finished_at IS NULL
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (subreddit_key,),
+        ).fetchone()
+        active_import_status = None
+        resumable_import = False
+        if active_job:
+            active_import_status = str(active_job["status"])
+            resumable_import = active_import_status == "interrupted"
+        semantic_chunks = int(rag["semantic_chunks"] or 0)
+        embedded_items = int(rag["embedded_items"] or 0)
+        item_count = int(row["items"] or 0)
+        if semantic_chunks == 0:
+            semantic_index_state = "not_built" if item_count else "empty"
+        elif embedded_items < item_count:
+            semantic_index_state = "partial"
+        else:
+            semantic_index_state = "ready"
 
         return {
             "subreddit": subreddit_key,
-            "items": int(row["items"] or 0),
+            "items": item_count,
             "posts": int(row["posts"] or 0),
             "comments": int(row["comments"] or 0),
             "min_created_utc": row["min_created_utc"],
@@ -961,8 +1154,14 @@ class Database:
             "source_files": [file_row["path"] for file_row in files],
             "latest_import_at": latest["import_at"] if latest else None,
             "latest_import_status": latest["status"] if latest else None,
-            "semantic_chunks": int(rag["semantic_chunks"] or 0),
-            "embedded_items": int(rag["embedded_items"] or 0),
+            "active_import_status": active_import_status,
+            "resumable_import": resumable_import,
+            "semantic_index_state": semantic_index_state,
+            "metadata_items": metadata_items,
+            "classifier_items": classifier_items,
+            "classifier_unavailable_items": classifier_unavailable_items,
+            "semantic_chunks": semantic_chunks,
+            "embedded_items": embedded_items,
             "embedding_model_ids": [model_row["embedding_model_id"] for model_row in model_rows],
             "embedding_dimensions": [int(dimension_row["embedding_dimensions"]) for dimension_row in dimension_rows],
             "metadata_fields": sorted(metadata_fields),

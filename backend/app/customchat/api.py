@@ -120,6 +120,7 @@ def create_app(
 ) -> FastAPI:
     database = database or Database(settings.database_path)
     database.initialize()
+    database.reconcile_interrupted_reddit_import_jobs()
     lemonade = lemonade or LemonadeClient(settings.lemonade_base_url)
     lemonade_factory = LemonadeClient
     web_search = web_search or WebSearchService()
@@ -375,7 +376,22 @@ def create_app(
     @app.post("/api/reddit-imports")
     async def reddit_import_start(request: RedditImportRequest, background_tasks: BackgroundTasks):
         try:
-            job = reddit_imports.create_job(RedditImportPayload(**request.model_dump()))
+            payload = RedditImportPayload(**request.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        normalized = payload.normalized()
+        existing = database.find_active_reddit_import_job(normalized)
+        if existing:
+            existing_id = int(existing["id"])
+            if run_reddit_imports_inline:
+                await reddit_imports.run_job(existing_id)
+            else:
+                background_tasks.add_task(reddit_imports.run_job, existing_id)
+            result = database.get_reddit_import_job(existing_id)
+            result["reused"] = True
+            return result
+        try:
+            job = reddit_imports.create_job(payload)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         job_id = int(job["id"])
@@ -391,6 +407,22 @@ def create_app(
         if job is None:
             raise HTTPException(status_code=404, detail="Reddit import job not found")
         return job
+
+    @app.patch("/api/reddit-imports/{job_id}")
+    async def reddit_import_interrupt(job_id: int):
+        job = database.get_reddit_import_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Reddit import job not found")
+        job_status = str(job.get("status") or "")
+        if job_status in ("completed", "failed"):
+            return job
+        database.update_reddit_import_job(
+            job_id,
+            status="interrupted",
+            current_stage=job.get("current_stage", ""),
+            log=f"{str(job.get('log') or '')} Manually interrupted.".strip(),
+        )
+        return database.get_reddit_import_job(job_id)
 
     @app.get("/api/sources")
     async def sources():
@@ -533,29 +565,32 @@ def create_app(
                 payload["chat_template_kwargs"] = {"enable_thinking": False}
             assistant_content: list[str] = []
             assistant_reasoning: list[str] = []
-            async for raw in active_lemonade.chat_stream(payload):
-                if raw.get("type") == "done":
-                    database.insert_message(
-                        conversation_id=conversation_id,
-                        role="assistant",
-                        content="".join(assistant_content),
-                        reasoning="".join(assistant_reasoning),
-                        metadata={"mode": request.mode, "model_id": selected_model_id},
-                    )
-                    yield _sse("done", {})
-                    continue
-                choice = (raw.get("choices") or [{}])[0]
-                delta = choice.get("delta") or {}
-                if "reasoning_content" in delta:
-                    assistant_reasoning.append(delta["reasoning_content"])
-                    yield _sse("reasoning", {"text": delta["reasoning_content"]})
-                if "content" in delta and delta["content"]:
-                    assistant_content.append(delta["content"])
-                    yield _sse("content", {"text": delta["content"]})
-                if "tool_calls" in delta:
-                    yield _sse("tool_call", {"tool_calls": delta["tool_calls"]})
-                if choice.get("finish_reason"):
-                    yield _sse("timing", {"finish_reason": choice["finish_reason"], "timings": raw.get("timings")})
+            try:
+                async for raw in active_lemonade.chat_stream(payload):
+                    if raw.get("type") == "done":
+                        database.insert_message(
+                            conversation_id=conversation_id,
+                            role="assistant",
+                            content="".join(assistant_content),
+                            reasoning="".join(assistant_reasoning),
+                            metadata={"mode": request.mode, "model_id": selected_model_id},
+                        )
+                        yield _sse("done", {})
+                        continue
+                    choice = (raw.get("choices") or [{}])[0]
+                    delta = choice.get("delta") or {}
+                    if "reasoning_content" in delta:
+                        assistant_reasoning.append(delta["reasoning_content"])
+                        yield _sse("reasoning", {"text": delta["reasoning_content"]})
+                    if "content" in delta and delta["content"]:
+                        assistant_content.append(delta["content"])
+                        yield _sse("content", {"text": delta["content"]})
+                    if "tool_calls" in delta:
+                        yield _sse("tool_call", {"tool_calls": delta["tool_calls"]})
+                    if choice.get("finish_reason"):
+                        yield _sse("timing", {"finish_reason": choice["finish_reason"], "timings": raw.get("timings")})
+            except Exception as exc:  # noqa: BLE001
+                yield _sse("error", {"message": str(exc), "model_id": selected_model_id})
 
         return StreamingResponse(events(), media_type="text/event-stream")
 
