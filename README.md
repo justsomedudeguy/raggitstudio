@@ -24,14 +24,17 @@ stay local and are intentionally ignored by git.
 - Routes exact count prompts, such as `How many times is "XXX" mentioned?`, to the raw
   archive index instead of asking the LLM to guess.
 - Adds archive-backed context to semantic chat queries so answers can cite raw Reddit rows.
-- Reddit import pipeline: download → metadata → classifier → semantic chunking → embedding.
-  Metadata and chunking run fast; classifier runs as a separate phase. Import resumes
-  gracefully from the last completed stage.
-- Duplicate import protection: starting an import for the same target returns the existing
-  active job instead of creating a duplicate.
+- Reddit import pipeline: checking embedding model -> downloading -> importing ->
+  metadata -> semantic chunking -> embedding -> completed. Classifier enrichment is
+  skipped for now and rows are marked for future enrichment.
+- Single-shot import behavior: start Reddit imports only when the machine can stay
+  available until completion. Half-imported data should be cleared before retrying.
+- Duplicate import protection: starting an import for the same target while one is
+  active returns a conflict instead of creating a duplicate or promising resume.
 - Stale job reconciliation: unfinished queued/running jobs from crashes are marked
-  interrupted at app startup.
-- Manual interrupt endpoint: `PATCH /api/reddit-imports/{job_id}` to pause a running job.
+  interrupted and finished at app startup.
+- Manual interrupt endpoint: `PATCH /api/reddit-imports/{job_id}` marks a running job
+  interrupted, but the current active path does not resume it.
 
 The Reddit archive importer is based on Arthur Heitmann's Arctic Shift tooling:
 https://github.com/ArthurHeitmann/arctic_shift.
@@ -46,6 +49,25 @@ https://github.com/ArthurHeitmann/arctic_shift.
 - Vision submission is gated by a runtime probe. Configure a compatible vision model and
   projection files at the endpoint before using screenshot/image submission.
 
+## Current Development State
+
+As of May 25, 2026, the active Reddit import strategy has been changed back to
+a single-shot RAG indexing flow. The previous resume-aware/classifier-heavy
+implementation was copied to `backend/app/customchat/reddit_import_resumable.py`
+for later revival, but the app does not call it now.
+
+The local `r/osint` archive import has completed through embeddings:
+
+- 18,165 Reddit rows imported.
+- 18,239 semantic chunks generated.
+- 18,239 archive embeddings written with `zembed-1-Q4_K_M-GGUF-Q4_K_M`.
+- Embedding vectors are 2,560 dimensions.
+- Archive coverage reports `semantic_index_state: ready`.
+
+Known remaining issue: there is still a chat UI bug to investigate. Stop here
+expecting the Reddit archive index to be ready, but the chat surface still needs
+a focused debugging pass before treating the app as polished.
+
 ## Setup
 
 ```powershell
@@ -55,10 +77,16 @@ cd frontend
 npm install
 ```
 
-Copy `.env.example` to `.env` and point it at your endpoint:
+Create `.env` at the repository root and point it at your endpoint:
 
 ```powershell
-Copy-Item .env.example .env
+@'
+CUSTOMCHAT_LEMONADE_BASE_URL=http://your-openai-compatible-host/v1
+CUSTOMCHAT_CHAT_MODEL_ID=your-chat-model
+CUSTOMCHAT_EMBEDDING_MODEL_ID=your-embedding-model
+CUSTOMCHAT_RERANKER_MODEL_ID=your-reranker-model
+CUSTOMCHAT_CLASSIFIER_MODEL_ID=your-classifier-model
+'@ | Set-Content .env
 ```
 
 The settings keep the historical `CUSTOMCHAT_LEMONADE_*` names for compatibility with
@@ -106,14 +134,24 @@ committed.
 
 The import runs in stages:
 
-1. **Download** — fetches posts/comments from Arctic Shift API.
-2. **Metadata** — adds deterministic fields (upvotes, poster counts) and marks classifier as unavailable.
-3. **Classifier** — runs LLM classification on each item (separate phase, progress visible in UI).
-4. **Chunking** — builds semantic chunks from item text.
-5. **Embedding** — generates embeddings for all chunks.
+1. **Checking embedding model** - verifies that the configured embedding model is
+   available before writing import data.
+2. **Downloading** - fetches posts/comments from Arctic Shift API.
+3. **Importing** - streams downloaded archive rows into SQLite.
+4. **Metadata** - adds deterministic fields (upvotes, poster counts, text stats) and
+   writes classifier metadata as `{"status": "skipped"}`.
+5. **Chunking** - builds semantic chunks from item text.
+6. **Embedding** - generates embeddings for all chunks.
 
-Import resumes from the last stage on restart. Duplicate imports for the same target
-return the existing job. Stale jobs from crashes are auto-marked interrupted.
+The active importer is a single-shot flow. It reports confirmed backend counters for
+downloaded rows, imported rows, metadata rows, semantic chunks, and embedded chunks.
+Duplicate imports for the same target return a conflict while an import is active.
+The older resume-aware/classifier-aware implementation is preserved in
+`backend/app/customchat/reddit_import_resumable.py` but is not called by the app.
+
+If an import is stopped halfway, clear that archive data before retrying. The
+clear path removes subreddit rows, archive semantic chunks, embeddings,
+generated HTML, and downloaded source archive files under `data/`.
 
 ## Test
 

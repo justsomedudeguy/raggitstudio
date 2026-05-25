@@ -59,6 +59,7 @@ import {
 import {
   archivePipelineMessage,
   compactListPreview,
+  deriveRedditImportProgress,
   formatClearStartedMessage,
   formatPurgeSummary,
   formatUtcDateRange,
@@ -658,6 +659,8 @@ function CorpusView({
   const [includePosts, setIncludePosts] = useState(true);
   const [includeComments, setIncludeComments] = useState(true);
   const [job, setJob] = useState<RedditImportJob | null>(null);
+  const [jobCoverage, setJobCoverage] = useState<ArchiveCoverage | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState("");
 
@@ -685,6 +688,8 @@ function CorpusView({
         include_comments: includeComments,
       });
       setJob(nextJob);
+      const archiveState = await fetchArchiveSubreddits();
+      setJobCoverage(archiveState.coverage);
       onArchiveDataChanged();
       await onRefreshStatus();
     } catch (startError) {
@@ -699,16 +704,18 @@ function CorpusView({
       return;
     }
     const interval = globalThis.setInterval(() => {
-      void fetchRedditImportJob(job.id)
-        .then((nextJob) => {
+      setNowMs(Date.now());
+      void Promise.all([fetchRedditImportJob(job.id), fetchArchiveSubreddits()])
+        .then(([nextJob, archiveState]) => {
           setJob(nextJob);
+          setJobCoverage(archiveState.coverage);
           onArchiveDataChanged();
           if (["completed", "failed", "partial"].includes(nextJob.status)) {
             void onRefreshStatus();
           }
         })
         .catch((pollError) => setError(errorMessage(pollError)));
-    }, 10_000);
+    }, 1_000);
     return () => globalThis.clearInterval(interval);
   }, [job, activeJob, onArchiveDataChanged, onRefreshStatus]);
 
@@ -717,7 +724,7 @@ function CorpusView({
       <ViewHeader
         eyebrow="Corpus"
         title="Reddit archive download"
-        detail="Download posts and comments, then automatically import, classify, chunk, and embed them for local RAG."
+        detail="Run a single-shot Reddit import that builds deterministic metadata, semantic chunks, and embeddings for local RAG."
       />
 
       {error && <InlineError message={error} />}
@@ -727,8 +734,8 @@ function CorpusView({
           <div>
             <PanelTitle icon={Globe} title="Download tool" />
             <p>
-              Download Reddit posts and comments, then load the archive into the local database with metadata, semantic
-              chunks, and vector embeddings.
+              Start this only when the machine can stay available. The active import path skips classifier enrichment
+              for now and focuses on building the RAG index from confirmed local rows.
             </p>
           </div>
           <Database size={24} />
@@ -785,7 +792,7 @@ function CorpusView({
         </button>
       </form>
 
-      {job && <RedditImportJobPanel job={job} />}
+      {job && <RedditImportJobPanel job={job} coverage={jobCoverage} nowMs={nowMs} />}
     </section>
   );
 }
@@ -1229,9 +1236,6 @@ function AvailableDataPanel({
   const [exploring, setExploring] = useState<Record<string, boolean>>({});
   const [exploreErrors, setExploreErrors] = useState<Record<string, string>>({});
   const [exploreNotes, setExploreNotes] = useState<Record<string, string>>({});
-  const [resuming, setResuming] = useState<Record<string, boolean>>({});
-  const [resumeErrors, setResumeErrors] = useState<Record<string, string>>({});
-  const [resumeNotes, setResumeNotes] = useState<Record<string, string>>({});
 
   async function refreshAvailableData() {
     setLoading(true);
@@ -1334,35 +1338,6 @@ function AvailableDataPanel({
     }
   }
 
-  async function resumeSubredditImport(summary: ArchiveSubredditSummary) {
-    const subreddit = summary.subreddit;
-    setResuming((current) => ({ ...current, [subreddit]: true }));
-    setResumeErrors((current) => ({ ...current, [subreddit]: "" }));
-    setResumeNotes((current) => ({
-      ...current,
-      [subreddit]: "Resuming import. Existing rows are kept; missing metadata, chunks, and embeddings will be filled.",
-    }));
-    try {
-      const job = await startRedditImport({
-        target_type: "subreddit",
-        target_name: subreddit,
-        start_date: "2005-01-01",
-        end_date: "now",
-        include_posts: summary.posts > 0,
-        include_comments: summary.comments > 0,
-      });
-      setResumeNotes((current) => ({
-        ...current,
-        [subreddit]: `Resume job ${job.id} started at ${job.current_stage}. Refresh to track archive pipeline counts.`,
-      }));
-      await refreshAvailableData();
-    } catch (resumeError) {
-      setResumeErrors((current) => ({ ...current, [subreddit]: errorMessage(resumeError) }));
-    } finally {
-      setResuming((current) => ({ ...current, [subreddit]: false }));
-    }
-  }
-
   useEffect(() => {
     void refreshAvailableData();
   }, [refreshKey]);
@@ -1436,11 +1411,7 @@ function AvailableDataPanel({
                   clearing={Boolean(clearing[summary.subreddit])}
                   clearError={clearErrors[summary.subreddit] || ""}
                   clearNote={clearNotes[summary.subreddit] || ""}
-                  resuming={Boolean(resuming[summary.subreddit])}
-                  resumeError={resumeErrors[summary.subreddit] || ""}
-                  resumeNote={resumeNotes[summary.subreddit] || ""}
                   onExplore={() => void exploreSubreddit(summary)}
-                  onResume={() => void resumeSubredditImport(summary)}
                   onClear={() => void clearSubreddit(summary)}
                 />
               ))
@@ -1460,11 +1431,7 @@ function SubredditDataCard({
   clearing,
   clearError,
   clearNote,
-  resuming,
-  resumeError,
-  resumeNote,
   onExplore,
-  onResume,
   onClear,
 }: {
   summary: ArchiveSubredditSummary;
@@ -1474,11 +1441,7 @@ function SubredditDataCard({
   clearing: boolean;
   clearError: string;
   clearNote: string;
-  resuming: boolean;
-  resumeError: string;
-  resumeNote: string;
   onExplore: () => void;
-  onResume: () => void;
   onClear: () => void;
 }) {
   const status = archiveImportStatus(summary);
@@ -1517,13 +1480,7 @@ function SubredditDataCard({
           <div className="inline-note">Import queued for r/{summary.subreddit}</div>
         )}
         {summary.active_import_status === "running" && (
-          <div className="inline-note">Import running for r/{summary.subreddit}</div>
-        )}
-        {summary.active_import_status === "interrupted" && (
-          <button type="button" className="button" onClick={onResume} disabled={resuming || clearing || exploring}>
-            {resuming ? <Loader2 size={16} className="spin" /> : <RefreshCw size={16} />}
-            {resuming ? "Resuming..." : "Resume"}
-          </button>
+          <div className="inline-note">Single-shot import running for r/{summary.subreddit}</div>
         )}
         <button type="button" className="button danger" onClick={onClear} disabled={clearing || exploring}>
           {clearing ? <Loader2 size={16} className="spin" /> : <Trash2 size={16} />}
@@ -1532,8 +1489,6 @@ function SubredditDataCard({
       </div>
       {error && <InlineError message={error} />}
       {note && <div className="inline-note">{note}</div>}
-      {resumeError && <InlineError message={resumeError} />}
-      {resumeNote && <div className="inline-note">{resumeNote}</div>}
       {clearError && <InlineError message={clearError} />}
       {clearNote && <div className="inline-note">{clearNote}</div>}
     </article>
@@ -1789,30 +1744,41 @@ function ArchiveSearchList({ results }: { results: ArchiveSearchResult[] }) {
   );
 }
 
-function RedditImportJobPanel({ job }: { job: RedditImportJob }) {
-  const counts = job.stage_counts ?? {};
-  const progress = Math.max(0, Math.min(100, Number(job.progress_percent) || 0));
+function RedditImportJobPanel({ job, coverage, nowMs }: { job: RedditImportJob; coverage?: ArchiveCoverage | null; nowMs: number }) {
+  const progress = deriveRedditImportProgress(job, coverage, nowMs);
   return (
     <section className="panel reddit-job">
       <div className="inspector-head">
         <div>
-          <PanelTitle icon={Loader2} title={`Import job ${job.id}: ${job.current_stage}`} />
+          <PanelTitle icon={job.status === "completed" ? CheckCircle2 : Loader2} title={`Import job ${job.id}: ${progress.stageLabel}`} />
           <div className="muted small">
-            {job.status} for {job.target_type}/{job.target_name} · ETA {job.eta_label || "estimating"}
+            {job.status} for {job.target_type}/{job.target_name} - ETA {progress.etaLabel}
           </div>
         </div>
         <StatusPill ok={job.status === "completed"} text={job.status} />
       </div>
+      <div className="muted small">
+        Accurate progress: {progress.etaLabel}, last backend update {progress.lastUpdatedLabel}
+      </div>
+      {progress.warnings.map((warning) => (
+        <div className="inline-note warn" key={warning}>{warning}</div>
+      ))}
       <div className="progress-track" aria-label="Import progress">
-        <div style={{ width: `${progress}%` }} />
+        <div style={{ width: `${progress.percent}%` }} />
+      </div>
+      <div className="stage-list">
+        {progress.stageRows.map((stage) => (
+          <div className={stage.complete ? "complete" : ""} key={stage.label}>
+            <span>{stage.label}</span>
+            <strong>{stage.value}</strong>
+          </div>
+        ))}
       </div>
       <div className="metric-grid compact">
-        <Metric label="Progress" value={`${Math.round(progress)}%`} />
-        <Metric label="Downloaded" value={formatCount(counts.downloaded_items)} />
-        <Metric label="Imported" value={formatCount(counts.imported_rows)} />
-        <Metric label="Metadata" value={formatCount(counts.metadata_rows)} />
-        <Metric label="Chunks" value={formatCount(counts.semantic_chunks)} />
-        <Metric label="Embedded" value={formatCount(counts.embedded_chunks)} />
+        <Metric label="Progress" value={`${Math.round(progress.percent)}%`} />
+        {progress.metricRows.map((row) => (
+          <Metric key={row.label} label={row.label} value={row.value} />
+        ))}
       </div>
       {job.log && <pre className="job-log">{job.log}</pre>}
     </section>
@@ -1921,11 +1887,12 @@ function ArchiveMetricGrid({ coverage, compact }: { coverage?: ArchiveCoverage |
       <Metric label="Posts" value={formatValue(coverage?.posts)} />
       <Metric label="Comments" value={formatValue(coverage?.comments)} />
       <Metric label="Metadata rows" value={formatRatio(coverage?.metadata_items, coverage?.items)} />
-      <Metric label="Classifier rows" value={formatRatio(coverage?.classifier_items, coverage?.items)} />
+      <Metric label="Classifier metadata" value={formatRatio(coverage?.classifier_items, coverage?.items)} />
+      <Metric label="Classifier skipped" value={formatRatio(coverage?.classifier_skipped_items, coverage?.items)} />
       <Metric label="Semantic chunks" value={formatValue(coverage?.semantic_chunks)} />
       <Metric label="Semantic embeddings" value={formatValue(coverage?.semantic_embeddings)} />
       <Metric label="Embedded items" value={formatValue(coverage?.embedded_items)} />
-      <Metric label="Interrupted jobs" value={formatValue(coverage?.stale_running_jobs)} />
+      <Metric label="Active jobs" value={formatValue(coverage?.stale_running_jobs)} />
     </div>
   );
 }

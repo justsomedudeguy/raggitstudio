@@ -4,6 +4,7 @@ import {
   archivePipelineMessage,
   buildRedditArchiveImportPlan,
   compactListPreview,
+  deriveRedditImportProgress,
   formatClearStartedMessage,
   formatPurgeSummary,
   formatUtcDateRange,
@@ -59,10 +60,10 @@ describe("data panel helpers", () => {
         embedded_items: 0,
         semantic_index_state: "not_built",
       }),
-    ).toBe("23,216 rows imported. Metadata 23,132 / 23,216. Classifier 5,592 / 23,216. Semantic index not built.");
+    ).toBe("23,216 rows imported. Metadata 23,132 / 23,216. Classifier skipped 5,592 / 23,216. Semantic index not built.");
   });
 
-  it("describes interrupted archive imports as resumable", () => {
+  it("does not describe interrupted archive imports as resumable", () => {
     expect(
       archivePipelineMessage({
         items: 23216,
@@ -73,7 +74,70 @@ describe("data panel helpers", () => {
         semantic_index_state: "not_built",
         resumable_import: true,
       }),
-    ).toBe("23,216 rows imported. Metadata 23,132 / 23,216. Classifier 5,592 / 23,216. Import interrupted; resume available.");
+    ).toBe("23,216 rows imported. Metadata 23,132 / 23,216. Classifier skipped 5,592 / 23,216. Semantic index not built.");
+  });
+
+  it("derives accurate single-shot import progress from confirmed counters", () => {
+    const progress = deriveRedditImportProgress(
+      {
+        id: 7,
+        target_type: "subreddit",
+        target_name: "theehive",
+        status: "running",
+        current_stage: "embedding",
+        stage_counts: {
+          downloaded_items: 200,
+          download_total: 200,
+          imported_rows: 200,
+          import_total: 200,
+          metadata_rows: 200,
+          metadata_total: 200,
+          classifier_skipped_items: 200,
+          semantic_chunks: 320,
+          chunk_total: 200,
+          chunked_items: 200,
+          embedded_chunks: 160,
+          embedding_total: 320,
+        },
+        progress_percent: 0,
+        eta_label: "about 4 min",
+        updated_at: "2026-05-25T01:00:00Z",
+      },
+      null,
+      Date.parse("2026-05-25T01:00:05Z"),
+    );
+
+    expect(progress.percent).toBe(85);
+    expect(progress.stageLabel).toBe("Embedding semantic chunks");
+    expect(progress.isStale).toBe(false);
+    expect(progress.metricRows).toContainEqual({ label: "Classifier skipped", value: "200 / 200" });
+    expect(progress.metricRows).toContainEqual({ label: "Embedded chunks", value: "160 / 320" });
+  });
+
+  it("flags stale single-shot import progress when the backend stops updating", () => {
+    const progress = deriveRedditImportProgress(
+      {
+        id: 8,
+        target_type: "subreddit",
+        target_name: "theehive",
+        status: "running",
+        current_stage: "metadata",
+        stage_counts: {
+          imported_rows: 100,
+          import_total: 100,
+          metadata_rows: 20,
+          metadata_total: 100,
+        },
+        progress_percent: 0,
+        eta_label: "estimating",
+        updated_at: "2026-05-25T01:00:00Z",
+      },
+      null,
+      Date.parse("2026-05-25T01:00:16Z"),
+    );
+
+    expect(progress.isStale).toBe(true);
+    expect(progress.warnings).toContain("No backend progress update for 16 seconds.");
   });
 
   it("builds local Arctic Shift dump imports from the selected subreddit", () => {

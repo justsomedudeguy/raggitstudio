@@ -383,13 +383,10 @@ def create_app(
         existing = database.find_active_reddit_import_job(normalized)
         if existing:
             existing_id = int(existing["id"])
-            if run_reddit_imports_inline:
-                await reddit_imports.run_job(existing_id)
-            else:
-                background_tasks.add_task(reddit_imports.run_job, existing_id)
-            result = database.get_reddit_import_job(existing_id)
-            result["reused"] = True
-            return result
+            raise HTTPException(
+                status_code=409,
+                detail=f"Import job {existing_id} is already {existing['status']} for this target. Let it finish before starting another single-shot import.",
+            )
         try:
             job = reddit_imports.create_job(payload)
         except ValueError as exc:

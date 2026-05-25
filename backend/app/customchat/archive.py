@@ -9,7 +9,7 @@ import traceback
 from dataclasses import asdict, dataclass
 from html import escape
 from pathlib import Path
-from typing import Any, BinaryIO, Iterable, Iterator
+from typing import Any, BinaryIO, Callable, Iterable, Iterator
 from urllib.parse import urlsplit
 
 from customchat.database import Database
@@ -153,7 +153,12 @@ class ArchiveService:
     def __init__(self, database: Database):
         self.database = database
 
-    def import_file(self, path: Path, kind: str | None = None) -> ArchiveImportResult:
+    def import_file(
+        self,
+        path: Path,
+        kind: str | None = None,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> ArchiveImportResult:
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(path)
@@ -178,6 +183,8 @@ class ArchiveService:
                     indexed += 1
                     if len(pending) >= 500:
                         flush_pending()
+                        if progress:
+                            progress(indexed, len(failures))
                     if indexed % 1000 == 0:
                         self.database.update_archive_file(
                             file_id,
@@ -186,9 +193,13 @@ class ArchiveService:
                             failed_count=len(failures),
                             log="\n".join(failures[-20:]),
                         )
+                        if progress:
+                            progress(indexed, len(failures))
                 except Exception as exc:  # noqa: BLE001 - keep indexing the rest of the archive
                     failures.append(f"{path}#{line_number}: {exc}")
             flush_pending()
+            if progress:
+                progress(indexed, len(failures))
             status = "completed" if not failures else "partial"
             log = "\n".join(failures)
             self.database.update_archive_file(file_id, status, indexed, len(failures), log, finished=True)

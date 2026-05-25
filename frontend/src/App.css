@@ -694,6 +694,32 @@ select:focus {
   transition: width 180ms ease;
 }
 
+.stage-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.stage-list div {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #f7fafb;
+  font-size: 12px;
+}
+
+.stage-list div.complete {
+  background: var(--ok-bg);
+}
+
+.stage-list span,
+.stage-list strong {
+  overflow-wrap: anywhere;
+}
+
 .split-grid,
 .retrieval-grid,
 .archive-grid {
@@ -1101,6 +1127,12 @@ select:focus {
   background: #eef8f7;
   border: 1px solid #b9dedb;
   color: var(--accent-strong);
+}
+
+.inline-note.warn {
+  background: var(--warn-bg);
+  border-color: #f0d08c;
+  color: var(--warn);
 }
 
 .empty {

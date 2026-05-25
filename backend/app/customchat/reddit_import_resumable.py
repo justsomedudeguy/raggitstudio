@@ -148,42 +148,22 @@ class RedditImportService:
         started = time.monotonic()
         counts: dict[str, Any] = {
             "downloaded_items": 0,
-            "download_total": 0,
             "downloaded_bytes": 0,
             "imported_rows": 0,
-            "import_total": 0,
             "metadata_rows": 0,
-            "metadata_total": 0,
-            "classifier_skipped_items": 0,
+            "classifier_items": 0,
             "semantic_chunks": 0,
-            "chunked_items": 0,
-            "chunk_total": 0,
             "embedded_chunks": 0,
-            "embedding_total": 0,
         }
-        last_update = 0.0
 
-        def update(
-            stage: str,
-            status: str = "running",
-            progress: int | None = None,
-            eta_total: int | None = None,
-            log: str = "",
-            *,
-            force: bool = False,
-        ) -> None:
-            nonlocal last_update
-            now = time.monotonic()
-            if not force and status == "running" and now - last_update < 1.0:
-                return
-            last_update = now
+        def update(stage: str, status: str = "running", progress: int = 0, eta_total: int | None = None, log: str = "") -> None:
             eta_seconds, eta_label = _eta(started, _completed_for_eta(counts, stage), eta_total, status)
             self.database.update_reddit_import_job(
                 job_id,
                 status=status,
                 current_stage=stage,
                 stage_counts=counts,
-                progress_percent=_overall_progress(counts, stage, status) if progress is None else progress,
+                progress_percent=progress,
                 eta_seconds=eta_seconds,
                 eta_label=eta_label,
                 log=log,
@@ -192,7 +172,7 @@ class RedditImportService:
 
         downloaded_paths: list[Path] = []
         try:
-            update("checking_embedding_model", progress=2, force=True)
+            update("checking_auxiliary_models", progress=2)
             await self._check_auxiliary_models()
             subreddits = self.database.archive_subreddits_for_import_target(payload["target_type"], payload["target_name"])
             selected_kinds = _selected_kinds(payload)
@@ -203,18 +183,10 @@ class RedditImportService:
             missing_kinds = [kind for kind in selected_kinds if existing_kind_counts.get(kind, 0) == 0]
             if existing_rows:
                 counts["downloaded_items"] = existing_rows
-                counts["download_total"] = existing_rows
                 counts["imported_rows"] = existing_rows
-                counts["import_total"] = existing_rows
-                update(
-                    "loading_existing_rows",
-                    progress=45,
-                    eta_total=max(1, existing_rows),
-                    log=f"Using {existing_rows} existing imported rows.",
-                    force=True,
-                )
+                update("resuming", progress=45, eta_total=max(1, existing_rows), log=f"Resuming from {existing_rows} imported rows.")
             if missing_kinds:
-                update("downloading", progress=5, force=True)
+                update("downloading", progress=5)
                 for kind in missing_kinds:
                     path = self._download_path(payload, kind)
                     base_downloaded = int(counts["downloaded_items"])
@@ -223,7 +195,7 @@ class RedditImportService:
                     def progress(downloaded: int, _total: int | None, byte_count: int) -> None:
                         counts["downloaded_items"] = base_downloaded + max(0, downloaded)
                         counts["downloaded_bytes"] = base_bytes + max(0, byte_count)
-                        update("downloading", eta_total=None)
+                        update("downloading", progress=15)
 
                     result = await self.downloader.download(
                         target_type=payload["target_type"],
@@ -237,24 +209,15 @@ class RedditImportService:
                     downloaded_paths.append(Path(result["path"]))
                     counts["downloaded_items"] = base_downloaded + int(result.get("count") or 0)
                     counts["downloaded_bytes"] = base_bytes + int(result.get("bytes") or 0)
-                    counts["download_total"] = int(counts["downloaded_items"])
-                    update("downloading", eta_total=max(1, int(counts["download_total"])), force=True)
 
-                counts["import_total"] = int(counts["downloaded_items"])
-                update("importing", progress=30, eta_total=max(1, int(counts["import_total"])), force=True)
+                update("importing", progress=30, eta_total=max(1, int(counts["downloaded_items"])))
                 imported_file_paths: list[str] = []
                 for path in downloaded_paths:
                     kind = "comment" if "comment" in path.name else "post"
-                    base_imported = int(counts["imported_rows"])
-
-                    def import_progress(indexed: int, _failed: int) -> None:
-                        counts["imported_rows"] = base_imported + max(0, indexed)
-                        update("importing", eta_total=max(1, int(counts["import_total"])))
-
-                    result = self.archive.import_file(path, kind=kind, progress=import_progress)
-                    counts["imported_rows"] = base_imported + result.indexed_count
+                    result = self.archive.import_file(path, kind=kind)
+                    counts["imported_rows"] = int(counts["imported_rows"]) + result.indexed_count
                     imported_file_paths.append(result.path)
-                    update("importing", eta_total=max(1, int(counts["import_total"])), force=True)
+                    update("importing", progress=45, eta_total=max(1, int(counts["downloaded_items"])))
 
                 subreddits = self.database.archive_subreddits_for_paths(imported_file_paths)
                 if existing_rows:
@@ -262,50 +225,33 @@ class RedditImportService:
                         set(subreddits)
                         | set(self.database.archive_subreddits_for_import_target(payload["target_type"], payload["target_name"]))
                     )
-            counts["metadata_total"] = int(counts["imported_rows"])
-            update("metadata", progress=55, eta_total=max(1, int(counts["metadata_total"])), force=True)
+            update("metadata", progress=55, eta_total=max(1, int(counts["imported_rows"])))
             for subreddit in subreddits:
-                base_metadata = int(counts["metadata_rows"])
-                base_skipped = int(counts["classifier_skipped_items"])
+                counts["metadata_rows"] = int(counts["metadata_rows"]) + await self._enrich_subreddit_metadata(subreddit)
+                update("metadata", progress=60, eta_total=max(1, int(counts["imported_rows"])))
 
-                def metadata_progress(processed: int, skipped: int) -> None:
-                    counts["metadata_rows"] = base_metadata + max(0, processed)
-                    counts["classifier_skipped_items"] = base_skipped + max(0, skipped)
-                    update("metadata", eta_total=max(1, int(counts["metadata_total"])))
+            update("classifier", progress=65, eta_total=max(1, int(counts["imported_rows"])))
+            for subreddit in subreddits:
+                counts["classifier_items"] = int(counts.get("classifier_items", 0)) + await self._classify_subreddit(subreddit)
+                update("classifier", progress=71, eta_total=max(1, int(counts["imported_rows"])))
 
-                metadata_rows, skipped_rows = await self._enrich_subreddit_metadata(subreddit, progress=metadata_progress)
-                counts["metadata_rows"] = base_metadata + metadata_rows
-                counts["classifier_skipped_items"] = base_skipped + skipped_rows
-                update("metadata", eta_total=max(1, int(counts["metadata_total"])), force=True)
-
-            counts["chunk_total"] = int(counts["metadata_rows"])
-            update("chunking", progress=72, eta_total=max(1, int(counts["chunk_total"])), force=True)
+            update("chunking", progress=72, eta_total=max(1, int(counts["metadata_rows"])))
             chunk_ids: list[int] = []
             for subreddit in subreddits:
-                base_chunked = int(counts["chunked_items"])
-                base_semantic = int(counts["semantic_chunks"])
-                base_embedded = int(counts["embedded_chunks"])
-
-                def chunk_progress(processed_items: int, chunk_count: int) -> None:
-                    counts["chunked_items"] = base_chunked + max(0, processed_items)
-                    counts["semantic_chunks"] = base_semantic + max(0, chunk_count)
-                    update("chunking", eta_total=max(1, int(counts["chunk_total"])))
-
-                self._build_subreddit_chunks(subreddit, progress=chunk_progress)
+                self._build_subreddit_chunks(subreddit)
                 semantic_counts = self.database.archive_semantic_counts_for_subreddit(subreddit, self.settings.embedding_model_id)
-                counts["semantic_chunks"] = base_semantic + semantic_counts["semantic_chunks"]
-                counts["embedded_chunks"] = base_embedded + semantic_counts["embedded_chunks"]
+                counts["semantic_chunks"] = int(counts["semantic_chunks"]) + semantic_counts["semantic_chunks"]
+                counts["embedded_chunks"] = int(counts["embedded_chunks"]) + semantic_counts["embedded_chunks"]
                 chunk_ids.extend(
                     self.database.list_unembedded_archive_semantic_chunk_ids(subreddit, self.settings.embedding_model_id)
                 )
-                update("chunking", eta_total=max(1, int(counts["chunk_total"])), force=True)
+                update("chunking", progress=82, eta_total=max(1, int(counts["metadata_rows"])))
 
-            counts["embedding_total"] = max(int(counts["semantic_chunks"]), len(chunk_ids))
-            update("embedding", progress=88, eta_total=max(1, int(counts["embedding_total"])), force=True)
+            update("embedding", progress=88, eta_total=max(1, len(chunk_ids)))
             await self._embed_chunks(chunk_ids, counts, update)
-            update("completed", status="completed", progress=100, eta_total=max(1, int(counts["embedded_chunks"])), force=True)
+            update("complete", status="completed", progress=100, eta_total=max(1, int(counts["embedded_chunks"])))
         except Exception as exc:  # noqa: BLE001 - job status should retain the failure
-            update("error", status="failed", progress=0, log=str(exc), force=True)
+            update("error", status="failed", progress=0, log=str(exc))
 
     def _download_path(self, payload: dict[str, Any], kind: str) -> Path:
         slug = _safe_slug(f"{payload['target_type']}-{payload['target_name']}")
@@ -313,40 +259,47 @@ class RedditImportService:
         directory = self.settings.data_dir / "reddit" / slug / timestamp
         return directory / f"{kind}s.jsonl"
 
-    async def _enrich_subreddit_metadata(
-        self,
-        subreddit: str,
-        progress: Callable[[int, int], None] | None = None,
-    ) -> tuple[int, int]:
+    async def _enrich_subreddit_metadata(self, subreddit: str) -> int:
         items = self.database.list_reddit_items_for_subreddit(subreddit)
         by_author = _author_rollups(items)
         processed = 0
-        skipped = 0
         for item in items:
             meta = dict(item.get("meta") or {})
-            if _deterministic_metadata_complete(meta):
-                classifier = meta.get("classifier")
-                already_skipped = isinstance(classifier, dict) and classifier.get("status") == "skipped"
-                if not already_skipped:
-                    meta["classifier"] = {"status": "skipped"}
-                    self.database.update_reddit_item_meta(int(item["id"]), meta)
-                skipped += 1
+            if _metadata_complete(meta):
                 processed += 1
-                if progress and processed % 500 == 0:
-                    progress(processed, skipped)
                 continue
             raw = dict(item.get("raw") or {})
             deterministic = _deterministic_metadata(item, raw, by_author.get(str(item.get("author") or ""), {}))
             meta.update(deterministic)
-            meta["classifier"] = {"status": "skipped"}
+            meta.setdefault("classifier", {"status": "unavailable"})
             self.database.update_reddit_item_meta(int(item["id"]), meta)
             processed += 1
-            skipped += 1
-            if progress and processed % 500 == 0:
-                progress(processed, skipped)
-        if progress:
-            progress(processed, skipped)
-        return processed, skipped
+        return processed
+
+    async def _classify_subreddit(self, subreddit: str) -> int:
+        items = self.database.list_reddit_items_for_subreddit(subreddit)
+        classified = 0
+        for item in items:
+            meta = dict(item.get("meta") or {})
+            classifier = meta.get("classifier")
+            if isinstance(classifier, dict) and classifier.get("status") != "unavailable":
+                classified += 1
+                continue
+            title = str(item.get("title") or f"Reddit {item.get('kind') or 'item'}")
+            text = str(item.get("text") or "")
+            try:
+                classified_result = await self.lemonade.classify(
+                    self.settings.classifier_model_id,
+                    title,
+                    text,
+                    "reddit_archive",
+                )
+                meta["classifier"] = classified_result.model_dump()
+            except Exception:
+                meta["classifier"] = {"status": "unavailable"}
+            self.database.update_reddit_item_meta(int(item["id"]), meta)
+            classified += 1
+        return classified
 
     async def _check_auxiliary_models(self) -> None:
         try:
@@ -358,19 +311,13 @@ class RedditImportService:
         if not vectors:
             raise RuntimeError(f"Auxiliary embedding model '{self.settings.embedding_model_id}' returned no vectors.")
 
-    def _build_subreddit_chunks(
-        self,
-        subreddit: str,
-        progress: Callable[[int, int], None] | None = None,
-    ) -> list[int]:
+    def _build_subreddit_chunks(self, subreddit: str) -> list[int]:
         items = self.database.list_reddit_items_for_subreddit(subreddit)
         posts_by_key, comments_by_key = _thread_indexes(items)
         chunk_ids: list[int] = []
-        for processed, item in enumerate(items, start=1):
+        for item in items:
             text = _contextual_text(item, posts_by_key, comments_by_key)
             if not text.strip():
-                if progress and processed % 500 == 0:
-                    progress(processed, len(chunk_ids))
                 continue
             metadata = dict(item.get("meta") or {})
             metadata.setdefault("title", item.get("title") or f"Reddit {item.get('kind') or 'item'}")
@@ -386,10 +333,6 @@ class RedditImportService:
                         metadata,
                     )
                 )
-            if progress and processed % 500 == 0:
-                progress(processed, len(chunk_ids))
-        if progress:
-            progress(len(items), len(chunk_ids))
         return chunk_ids
 
     async def _embed_chunks(self, chunk_ids: list[int], counts: dict[str, Any], update: Callable[..., None]) -> int:
@@ -417,8 +360,14 @@ def _selected_kinds(payload: dict[str, Any]) -> list[str]:
     return kinds
 
 
-def _deterministic_metadata_complete(meta: dict[str, Any]) -> bool:
-    return "upvotes" in meta and "poster_archive_item_count" in meta
+def _metadata_complete(meta: dict[str, Any]) -> bool:
+    classifier = meta.get("classifier")
+    return (
+        "upvotes" in meta
+        and "poster_archive_item_count" in meta
+        and isinstance(classifier, dict)
+        and bool(classifier)
+    )
 
 
 def _clean_target_name(value: str) -> str:
@@ -488,38 +437,12 @@ def _eta(started: float, completed: int, total: int | None, status: str) -> tupl
     return remaining, f"about {minutes} min"
 
 
-def _overall_progress(counts: dict[str, Any], stage: str, status: str) -> int:
-    if status == "completed":
-        return 100
-    if status == "failed":
-        return 0
-    weights = [
-        ("checking_embedding_model", 2, None, None),
-        ("downloading", 13, "downloaded_items", "download_total"),
-        ("importing", 18, "imported_rows", "import_total"),
-        ("metadata", 17, "metadata_rows", "metadata_total"),
-        ("chunking", 20, "chunked_items", "chunk_total"),
-        ("embedding", 30, "embedded_chunks", "embedding_total"),
-    ]
-    stage_index = next((index for index, item in enumerate(weights) if item[0] == stage), 0)
-    completed = sum(weight for _, weight, _, _ in weights[:stage_index])
-    _, current_weight, count_key, total_key = weights[stage_index]
-    if count_key is None or total_key is None:
-        return completed
-    total = int(counts.get(total_key) or 0)
-    count = int(counts.get(count_key) or 0)
-    if total <= 0:
-        return completed
-    ratio = max(0.0, min(1.0, count / total))
-    return max(0, min(99, int(completed + current_weight * ratio)))
-
-
 def _completed_for_eta(counts: dict[str, Any], stage: str) -> int:
     key = {
         "downloading": "downloaded_items",
         "importing": "imported_rows",
         "metadata": "metadata_rows",
-        "chunking": "chunked_items",
+        "chunking": "semantic_chunks",
         "embedding": "embedded_chunks",
     }.get(stage)
     return int(counts.get(key) or 0) if key else 0

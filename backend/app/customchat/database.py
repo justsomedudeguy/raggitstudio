@@ -356,7 +356,9 @@ class Database:
                     SUM(CASE WHEN meta_json IS NOT NULL AND meta_json != '{}' THEN 1 ELSE 0 END) AS metadata_items,
                     SUM(CASE WHEN json_extract(meta_json, '$.classifier') IS NOT NULL THEN 1 ELSE 0 END) AS classifier_items,
                     SUM(CASE WHEN json_extract(meta_json, '$.classifier.status') = 'unavailable' THEN 1 ELSE 0 END)
-                        AS classifier_unavailable_items
+                        AS classifier_unavailable_items,
+                    SUM(CASE WHEN json_extract(meta_json, '$.classifier.status') = 'skipped' THEN 1 ELSE 0 END)
+                        AS classifier_skipped_items
                 FROM reddit_items
              """
             ).fetchone()
@@ -364,7 +366,7 @@ class Database:
                 """
                 SELECT
                     SUM(CASE WHEN status='running' AND finished_at IS NULL THEN 1 ELSE 0 END) AS stale_running_jobs,
-                    SUM(CASE WHEN status='interrupted' AND finished_at IS NULL THEN 1 ELSE 0 END) AS resumable_import_jobs
+                    0 AS resumable_import_jobs
                 FROM reddit_import_jobs
                 """
             ).fetchone()
@@ -378,6 +380,7 @@ class Database:
             "metadata_items": int(metadata["metadata_items"] or 0),
             "classifier_items": int(metadata["classifier_items"] or 0),
             "classifier_unavailable_items": int(metadata["classifier_unavailable_items"] or 0),
+            "classifier_skipped_items": int(metadata["classifier_skipped_items"] or 0),
             "semantic_chunks": int(chunks["count"] or 0),
             "semantic_embeddings": int(embeddings["count"] or 0),
             "embedded_items": int(embedded["count"] or 0),
@@ -459,7 +462,7 @@ class Database:
                 SELECT * FROM reddit_import_jobs
                 WHERE LOWER(target_type) = ?
                     AND LOWER(target_name) = LOWER(?)
-                    AND status IN ('queued', 'running', 'interrupted')
+                    AND status IN ('queued', 'running')
                     AND finished_at IS NULL
                 ORDER BY updated_at DESC, id DESC
                 LIMIT 1
@@ -485,7 +488,8 @@ class Database:
                     UPDATE reddit_import_jobs
                     SET status = 'interrupted',
                         log = COALESCE(log, '') || 'Interrupted at app startup: unfinished job.',
-                        updated_at = CURRENT_TIMESTAMP
+                        updated_at = CURRENT_TIMESTAMP,
+                        finished_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
                     (job_id,),
@@ -1102,6 +1106,7 @@ class Database:
         metadata_items = 0
         classifier_items = 0
         classifier_unavailable_items = 0
+        classifier_skipped_items = 0
         for metadata_row in metadata_rows:
             try:
                 metadata = json.loads(metadata_row["meta_json"])
@@ -1116,13 +1121,15 @@ class Database:
                     classifier_items += 1
                     if isinstance(classifier, dict) and classifier.get("status") == "unavailable":
                         classifier_unavailable_items += 1
+                    if isinstance(classifier, dict) and classifier.get("status") == "skipped":
+                        classifier_skipped_items += 1
         active_job = db.execute(
             """
             SELECT *
             FROM reddit_import_jobs
             WHERE target_type = 'subreddit'
                 AND LOWER(target_name) = ?
-                AND status IN ('queued', 'running', 'interrupted')
+                AND status IN ('queued', 'running')
                 AND finished_at IS NULL
             ORDER BY updated_at DESC, id DESC
             LIMIT 1
@@ -1133,7 +1140,6 @@ class Database:
         resumable_import = False
         if active_job:
             active_import_status = str(active_job["status"])
-            resumable_import = active_import_status == "interrupted"
         semantic_chunks = int(rag["semantic_chunks"] or 0)
         embedded_items = int(rag["embedded_items"] or 0)
         item_count = int(row["items"] or 0)
@@ -1160,6 +1166,7 @@ class Database:
             "metadata_items": metadata_items,
             "classifier_items": classifier_items,
             "classifier_unavailable_items": classifier_unavailable_items,
+            "classifier_skipped_items": classifier_skipped_items,
             "semantic_chunks": semantic_chunks,
             "embedded_items": embedded_items,
             "embedding_model_ids": [model_row["embedding_model_id"] for model_row in model_rows],

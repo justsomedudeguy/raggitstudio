@@ -18,6 +18,7 @@ class FakeLemonade:
         self.probe_model_ids = []
         self.loaded_model_ids = []
         self.chat_payloads = []
+        self.classify_calls = []
 
     async def list_models(self):
         return {
@@ -60,6 +61,9 @@ class FakeLemonade:
         return {"model_id": model_id}
 
     async def classify(self, model_id: str, title: str, text: str, source_type: str):
+        self.classify_calls.append(
+            {"model_id": model_id, "title": title, "text": text, "source_type": source_type}
+        )
         return SourceMetadata(
             document_type="note",
             source_type=source_type,
@@ -372,7 +376,7 @@ def test_archive_subreddit_summaries_include_metadata_and_rag_counts(tmp_path):
     assert summary["metadata_fields"] == ["source", "topic"]
 
 
-def test_archive_subreddit_summary_reports_interrupted_import_as_resumable(tmp_path):
+def test_archive_subreddit_summary_does_not_report_interrupted_import_as_resumable(tmp_path):
     app = _app(tmp_path)
     client = TestClient(app)
     archive = tmp_path / "r_theehive_posts.jsonl"
@@ -404,10 +408,10 @@ def test_archive_subreddit_summary_reports_interrupted_import_as_resumable(tmp_p
     assert response.status_code == 200
     data = response.json()
     assert data["coverage"]["stale_running_jobs"] == 0
-    assert data["coverage"]["resumable_import_jobs"] == 1
+    assert data["coverage"]["resumable_import_jobs"] == 0
     [summary] = data["subreddits"]
-    assert summary["active_import_status"] == "interrupted"
-    assert summary["resumable_import"] is True
+    assert summary["active_import_status"] is None
+    assert summary["resumable_import"] is False
     assert summary["semantic_index_state"] == "not_built"
 
 
@@ -576,20 +580,28 @@ def test_reddit_import_job_downloads_imports_metadata_chunks_embeddings_and_eta(
     assert started.status_code == 200
     job = client.get(f"/api/reddit-imports/{started.json()['id']}").json()
     assert job["status"] == "completed"
-    assert job["current_stage"] == "complete"
+    assert job["current_stage"] == "completed"
     assert job["progress_percent"] == 100
     assert job["eta_label"] == "complete"
     assert job["stage_counts"]["downloaded_items"] == 2
+    assert job["stage_counts"]["download_total"] == 2
     assert job["stage_counts"]["imported_rows"] == 2
+    assert job["stage_counts"]["import_total"] == 2
     assert job["stage_counts"]["metadata_rows"] == 2
+    assert job["stage_counts"]["metadata_total"] == 2
     assert job["stage_counts"]["semantic_chunks"] >= 2
+    assert job["stage_counts"]["chunk_total"] == 2
     assert job["stage_counts"]["embedded_chunks"] == job["stage_counts"]["semantic_chunks"]
+    assert job["stage_counts"]["embedding_total"] == job["stage_counts"]["semantic_chunks"]
+    assert job["stage_counts"]["classifier_skipped_items"] == 2
     assert {call["kind"] for call in fake_downloader.calls} == {"post", "comment"}
+    assert fake_lemonade.classify_calls == []
 
     [summary] = client.get("/api/archives/subreddits").json()["subreddits"]
     assert summary["subreddit"] == "theehive"
     assert summary["semantic_chunks"] >= 2
     assert summary["embedded_items"] == 2
+    assert summary["classifier_skipped_items"] == 2
     assert "upvotes" in summary["metadata_fields"]
     assert "poster_karma" in summary["metadata_fields"]
     assert "poster_account_age_days_at_post" in summary["metadata_fields"]
@@ -603,11 +615,12 @@ def test_reddit_import_job_downloads_imports_metadata_chunks_embeddings_and_eta(
     assert fake_lemonade.embed_model_ids == ["embedder", "embedder", "embedder"]
 
 
-def test_reddit_import_job_indexes_semantics_when_classifier_aux_model_is_not_ready(tmp_path):
+def test_reddit_import_job_indexes_semantics_without_classifier_calls(tmp_path):
     fake_downloader = FakeRedditDownloader()
+    fake_lemonade = FailingClassifierLemonade()
     app = _app(
         tmp_path,
-        lemonade=FailingClassifierLemonade(),
+        lemonade=fake_lemonade,
         reddit_downloader=fake_downloader,
         run_reddit_imports_inline=True,
     )
@@ -628,15 +641,18 @@ def test_reddit_import_job_indexes_semantics_when_classifier_aux_model_is_not_re
     assert started.status_code == 200
     job = client.get(f"/api/reddit-imports/{started.json()['id']}").json()
     assert job["status"] == "completed"
-    assert job["current_stage"] == "complete"
+    assert job["current_stage"] == "completed"
     assert job["stage_counts"]["semantic_chunks"] >= 2
     assert job["stage_counts"]["embedded_chunks"] == job["stage_counts"]["semantic_chunks"]
+    assert job["stage_counts"]["classifier_skipped_items"] == 2
     [summary] = client.get("/api/archives/subreddits").json()["subreddits"]
     assert summary["semantic_index_state"] == "ready"
-    assert summary["classifier_unavailable_items"] == 2
+    assert summary["classifier_unavailable_items"] == 0
+    assert summary["classifier_skipped_items"] == 2
+    assert fake_lemonade.classify_calls == []
 
 
-def test_reddit_import_start_reuses_active_job_for_same_target(tmp_path):
+def test_reddit_import_start_refuses_duplicate_active_job_for_same_target(tmp_path):
     fake_downloader = FakeRedditDownloader()
     fake_lemonade = FakeLemonade()
     app = _app(
@@ -675,12 +691,11 @@ def test_reddit_import_start_reuses_active_job_for_same_target(tmp_path):
     })
     db.update_reddit_import_job(job_id_2, status="running", current_stage="metadata")
 
-    # Second POST should find the active job and reuse it
+    # Second POST should refuse to launch another active worker.
     second = client.post("/api/reddit-imports", json=payload)
-    assert second.status_code == 200
-    assert second.json()["id"] == job_id_2
-    assert second.json()["reused"] is True
-    # Only 2 job rows: the completed one and the reused one
+    assert second.status_code == 409
+    assert str(job_id_2) in second.json()["detail"]
+    # Only 2 job rows: the completed one and the active one that caused the conflict.
     assert app.state.database.count_rows("reddit_import_jobs") == 2
 
 
@@ -706,10 +721,11 @@ def test_create_app_marks_unfinished_import_jobs_interrupted(tmp_path):
     job = client.get(f"/api/reddit-imports/{job_id}").json()
     assert job["status"] == "interrupted"
     assert "interrupted" in job["log"].lower()
-    assert client.get("/api/status").json()["archive"]["resumable_import_jobs"] == 1
+    assert job["finished_at"] is not None
+    assert client.get("/api/status").json()["archive"]["resumable_import_jobs"] == 0
 
 
-def test_reddit_import_job_resumes_from_existing_archive_rows_after_interruption(tmp_path):
+def test_reddit_import_job_uses_existing_archive_rows_without_redownloading(tmp_path):
     fake_downloader = FakeRedditDownloader()
     fake_lemonade = FakeLemonade()
     app = _app(
@@ -778,15 +794,20 @@ def test_reddit_import_job_resumes_from_existing_archive_rows_after_interruption
     job = client.get(f"/api/reddit-imports/{started.json()['id']}").json()
     assert job["status"] == "completed"
     assert job["stage_counts"]["downloaded_items"] == 2
+    assert job["stage_counts"]["download_total"] == 2
     assert job["stage_counts"]["imported_rows"] == 2
+    assert job["stage_counts"]["import_total"] == 2
     assert job["stage_counts"]["metadata_rows"] == 2
+    assert job["stage_counts"]["metadata_total"] == 2
     assert job["stage_counts"]["semantic_chunks"] >= 1
     assert job["stage_counts"]["embedded_chunks"] == job["stage_counts"]["semantic_chunks"]
+    assert job["stage_counts"]["classifier_skipped_items"] == 2
     assert fake_downloader.calls == []
 
     [summary] = client.get("/api/archives/subreddits").json()["subreddits"]
     assert summary["semantic_chunks"] >= 1
     assert summary["embedded_items"] == 2
+    assert summary["classifier_skipped_items"] == 2
     assert "classifier" in summary["metadata_fields"]
 
 

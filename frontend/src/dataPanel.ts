@@ -9,11 +9,35 @@ export interface ArchivePipelineSummary {
   items: number;
   metadata_items?: number | null;
   classifier_items?: number | null;
+  classifier_skipped_items?: number | null;
   semantic_chunks: number;
   embedded_items: number;
   semantic_index_state?: string | null;
   resumable_import?: boolean | null;
   active_import_status?: string | null;
+}
+
+export interface RedditImportProgressJob {
+  id: number;
+  target_type: string;
+  target_name: string;
+  status: string;
+  current_stage: string;
+  stage_counts?: Record<string, number> | null;
+  progress_percent?: number | null;
+  eta_label?: string | null;
+  updated_at?: string | null;
+}
+
+export interface RedditImportProgressView {
+  percent: number;
+  stageLabel: string;
+  stageRows: Array<{ label: string; value: string; complete: boolean }>;
+  metricRows: Array<{ label: string; value: string }>;
+  etaLabel: string;
+  lastUpdatedLabel: string;
+  isStale: boolean;
+  warnings: string[];
 }
 
 export function buildRedditArchiveImportPlan(
@@ -86,21 +110,71 @@ export function formatClearStartedMessage(subreddit: string, itemCount?: number 
 export function archivePipelineMessage(summary: ArchivePipelineSummary): string {
   const rows = formatInteger(summary.items);
   const metadata = `${formatInteger(summary.metadata_items ?? 0)} / ${rows}`;
-  const classifier = `${formatInteger(summary.classifier_items ?? 0)} / ${rows}`;
+  const classifierSkipped = `${formatInteger(summary.classifier_skipped_items ?? summary.classifier_items ?? 0)} / ${rows}`;
   const importStatus = summary.active_import_status;
   if (importStatus === "queued" || importStatus === "running") {
-    return `${rows} rows imported. Metadata ${metadata}. Classifier ${classifier}. Import ${importStatus}.`;
-  }
-  if (summary.resumable_import) {
-    return `${rows} rows imported. Metadata ${metadata}. Classifier ${classifier}. Import interrupted; resume available.`;
+    return `${rows} rows imported. Metadata ${metadata}. Classifier skipped ${classifierSkipped}. Import ${importStatus}.`;
   }
   if ((summary.semantic_index_state ?? "") === "not_built" || summary.semantic_chunks === 0) {
-    return `${rows} rows imported. Metadata ${metadata}. Classifier ${classifier}. Semantic index not built.`;
+    return `${rows} rows imported. Metadata ${metadata}. Classifier skipped ${classifierSkipped}. Semantic index not built.`;
   }
   if ((summary.semantic_index_state ?? "") === "partial" || summary.embedded_items < summary.items) {
-    return `${rows} rows imported. Metadata ${metadata}. Classifier ${classifier}. Semantic index partial.`;
+    return `${rows} rows imported. Metadata ${metadata}. Classifier skipped ${classifierSkipped}. Semantic index partial.`;
   }
-  return `${rows} rows imported. Metadata ${metadata}. Classifier ${classifier}. Semantic index ready.`;
+  return `${rows} rows imported. Metadata ${metadata}. Classifier skipped ${classifierSkipped}. Semantic index ready.`;
+}
+
+export function deriveRedditImportProgress(
+  job: RedditImportProgressJob,
+  _coverage: unknown = null,
+  nowMs = Date.now(),
+): RedditImportProgressView {
+  const counts = job.stage_counts ?? {};
+  const stages = [
+    { key: "checking_embedding_model", label: "Checking embedding model", count: null, total: null, weight: 2 },
+    { key: "downloading", label: "Downloading Reddit rows", count: "downloaded_items", total: "download_total", weight: 13 },
+    { key: "importing", label: "Importing rows into SQLite", count: "imported_rows", total: "import_total", weight: 18 },
+    { key: "metadata", label: "Writing deterministic metadata", count: "metadata_rows", total: "metadata_total", weight: 17 },
+    { key: "chunking", label: "Building semantic chunks", count: "chunked_items", total: "chunk_total", weight: 20 },
+    { key: "embedding", label: "Embedding semantic chunks", count: "embedded_chunks", total: "embedding_total", weight: 30 },
+  ] as const;
+  const stageIndex = Math.max(0, stages.findIndex((stage) => stage.key === job.current_stage));
+  const activeStage = stages[stageIndex] ?? stages[0];
+  const stageLabel = job.status === "completed" ? "Completed" : activeStage.label;
+  const completedWeight = stages.slice(0, stageIndex).reduce((total, stage) => total + stage.weight, 0);
+  const stageRatio = activeStage.count && activeStage.total ? ratio(counts[activeStage.count], counts[activeStage.total]) : 0;
+  const calculatedPercent = job.status === "completed" ? 100 : Math.min(99, Math.round(completedWeight + activeStage.weight * stageRatio));
+  const updatedAtMs = parseTimestampMs(job.updated_at);
+  const staleSeconds = updatedAtMs ? Math.floor((nowMs - updatedAtMs) / 1000) : 0;
+  const isActive = job.status === "queued" || job.status === "running";
+  const isStale = isActive && staleSeconds > 15;
+  const warnings = isStale ? [`No backend progress update for ${staleSeconds} seconds.`] : [];
+
+  return {
+    percent: Math.max(0, Math.min(100, calculatedPercent)),
+    stageLabel,
+    stageRows: stages.slice(1).map((stage) => {
+      const count = stage.count ? counts[stage.count] : 0;
+      const total = stage.total ? counts[stage.total] : 0;
+      return {
+        label: stage.label,
+        value: formatCountPair(count, total),
+        complete: ratio(count, total) >= 1,
+      };
+    }),
+    metricRows: [
+      { label: "Downloaded rows", value: formatCountPair(counts.downloaded_items, counts.download_total) },
+      { label: "Imported rows", value: formatCountPair(counts.imported_rows, counts.import_total) },
+      { label: "Metadata rows", value: formatCountPair(counts.metadata_rows, counts.metadata_total) },
+      { label: "Classifier skipped", value: formatCountPair(counts.classifier_skipped_items, counts.metadata_total) },
+      { label: "Semantic chunks", value: formatCountPair(counts.semantic_chunks, counts.embedding_total || counts.semantic_chunks) },
+      { label: "Embedded chunks", value: formatCountPair(counts.embedded_chunks, counts.embedding_total) },
+    ],
+    etaLabel: job.eta_label || "estimating",
+    lastUpdatedLabel: updatedAtMs ? `${Math.max(0, staleSeconds)}s ago` : "unknown",
+    isStale,
+    warnings,
+  };
 }
 
 export function openArchiveExportUrl(openUrl: string, opener: BrowserOpener | undefined = defaultOpener()): boolean {
@@ -114,6 +188,35 @@ export function openArchiveExportUrl(openUrl: string, opener: BrowserOpener | un
 
 function formatInteger(value: number): string {
   return new Intl.NumberFormat().format(value);
+}
+
+function formatCountPair(value: unknown, total: unknown): string {
+  const current = finiteNumber(value);
+  const totalValue = finiteNumber(total);
+  if (totalValue > 0) {
+    return `${formatInteger(current)} / ${formatInteger(totalValue)}`;
+  }
+  return formatInteger(current);
+}
+
+function ratio(value: unknown, total: unknown): number {
+  const totalValue = finiteNumber(total);
+  if (totalValue <= 0) {
+    return 0;
+  }
+  return Math.max(0, Math.min(1, finiteNumber(value) / totalValue));
+}
+
+function finiteNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
+}
+
+function parseTimestampMs(value?: string | null): number {
+  if (!value) {
+    return 0;
+  }
+  const parsed = Date.parse(value.includes("T") ? value : value.replace(" ", "T"));
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 function formatUtcDate(value?: number | null): string {

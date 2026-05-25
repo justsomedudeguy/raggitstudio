@@ -80,6 +80,7 @@ export interface ArchiveCoverage {
   metadata_items?: number;
   classifier_items?: number;
   classifier_unavailable_items?: number;
+  classifier_skipped_items?: number;
   semantic_chunks: number;
   semantic_embeddings?: number;
   embedded_items: number;
@@ -104,6 +105,7 @@ export interface ArchiveSubredditSummary extends JsonRecord {
   metadata_items?: number | null;
   classifier_items?: number | null;
   classifier_unavailable_items?: number | null;
+  classifier_skipped_items?: number | null;
   semantic_chunks: number;
   embedded_items: number;
   embedding_model_ids?: string[] | string | null;
